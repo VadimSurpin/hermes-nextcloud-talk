@@ -1,0 +1,17 @@
+version: 2
+updates:
+  # GitHub Actions (если добавятся workflow)
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+
+  # Python-зависимости адаптера (httpx тянется из Hermes, тут только фикс версий для CI)
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    ignore:
+      # httpx обновляется вместе с Hermes — не ломать совместимость
+      - dependency-name: "httpx"
+        versions: [">=0.28"]
