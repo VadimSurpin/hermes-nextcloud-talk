@@ -3,6 +3,14 @@
 All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+- Reactions: `react()`, `unreact()`, `get_reactions()` via `/reaction/{token}/{messageId}`.
+- Threads: `send(metadata={"thread_title": ...})` creates a thread; `{"thread_id": ...}` replies into one.
+- `listen()` now maps `threadId`, `reactions`, and `replyTo` into `MessageEvent` (`reply_to_message_id` + `metadata`).
+- `send()` supports `silent` flag.
+
 ## [1.0.0] — 2026-09-06
 
 ### Added
