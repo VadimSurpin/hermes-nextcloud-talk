@@ -3,6 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Platform: Hermes Agent](https://img.shields.io/badge/Platform-Hermes_Agent-black)](https://hermes-agent.nousresearch.com)
 [![Nextcloud Talk](https://img.shields.io/badge/Nextcloud_Talk-%E2%89%A517-blue)](https://github.com/nextcloud/spreed)
+[![Install](https://img.shields.io/badge/Install-hermes_plugins_install-2ea44f)](#installation)
 
 A Hermes Agent platform plugin that turns **Nextcloud Talk** into a full-featured communication channel: text, native voice messages with a compact waveform player, images/videos/files with captions — just like Telegram.
 
@@ -20,7 +21,14 @@ A Hermes Agent platform plugin that turns **Nextcloud Talk** into a full-feature
 
 ## Installation
 
-### 1. Copy the plugin
+### Option A — via Hermes CLI (recommended)
+
+```bash
+hermes plugins install VadimSurpin/hermes-nextcloud-talk
+hermes plugins enable nextcloud-talk-platform
+```
+
+### Option B — manual copy
 
 ```bash
 mkdir -p ~/.hermes/plugins/nextcloud-talk
