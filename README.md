@@ -4,30 +4,30 @@
 [![Platform: Hermes Agent](https://img.shields.io/badge/Platform-Hermes_Agent-black)](https://hermes-agent.nousresearch.com)
 [![Nextcloud Talk](https://img.shields.io/badge/Nextcloud_Talk-%E2%89%A517-blue)](https://github.com/nextcloud/spreed)
 
-Плагин-платформа, превращающий **Nextcloud Talk** в полноценный канал общения с Hermes Agent: текст, нативные голосовые с waveform-плеером, картинки/видео/файлы с подписями — как в Telegram.
+A Hermes Agent platform plugin that turns **Nextcloud Talk** into a full-featured communication channel: text, native voice messages with a compact waveform player, images/videos/files with captions — just like Telegram.
 
-## Возможности
+## Features
 
-| Функция | Реализация |
+| Feature | Implementation |
 |---|---|
-| Приём сообщений | Long-poll `GET /chat/{token}?lookIntoFuture=1`, автофильтр собственных сообщений |
-| Отправка текста | `POST /chat/{token}` |
-| 🎙 Голосовые (нативные) | OGG → MP3 (ffmpeg) → Draft-folder → attachment endpoint → компактный waveform-плеер |
-| 🖼 Картинки / 🎬 Видео / файлы | Attachment endpoint + `caption` в `talkMetaData` — подпись на самом медиа |
-| 📎 Фолбэк доставки | Share-to-chat (`shareType=10`) при недоступности attachment-endpoint |
-| ⏰ Cron-доставка | `deliver=talk` + переменная `TALK_HOME_CHANNEL` |
-| 🧠 Стек Hermes | Сессии, память, скиллы, pairing — всё работает |
+| Message receiving | Long-poll `GET /chat/{token}?lookIntoFuture=1`, own messages auto-filtered |
+| Text sending | `POST /chat/{token}` |
+| 🎙 Native voice messages | OGG → MP3 (ffmpeg) → Draft-folder → attachment endpoint with `messageType: voice-message` → compact waveform player |
+| 🖼 Images / 🎬 Videos / files | Attachment endpoint + `caption` in `talkMetaData` — caption lives on the media itself |
+| 📎 Delivery fallback | Share-to-chat (`shareType=10`) when the attachment endpoint is unavailable |
+| ⏰ Cron delivery | `deliver=talk` + `TALK_HOME_CHANNEL` |
+| 🧠 Full Hermes stack | Sessions, memory, skills, pairing — everything works |
 
-## Установка
+## Installation
 
-### 1. Скопируйте плагин
+### 1. Copy the plugin
 
 ```bash
 mkdir -p ~/.hermes/plugins/nextcloud-talk
 cp adapter.py plugin.yaml __init__.py ~/.hermes/plugins/nextcloud-talk/
 ```
 
-Структура:
+Structure:
 
 ```
 ~/.hermes/plugins/nextcloud-talk/
@@ -36,7 +36,7 @@ cp adapter.py plugin.yaml __init__.py ~/.hermes/plugins/nextcloud-talk/
 └── plugin.yaml
 ```
 
-### 2. Настройте config.yaml
+### 2. Configure config.yaml
 
 ```yaml
 plugins:
@@ -50,14 +50,14 @@ platforms:
       server: https://nextcloud.example.com
       user: hermes
       app_password: <app-password>
-      room_token: <room-token>       # комната по умолчанию
+      room_token: <room-token>       # default room
     home_channel:
-      platform: talk                 # ОБЯЗАТЕЛЬНО ровно эти 3 ключа
+      platform: talk                 # MUST be exactly these 3 keys
       chat_id: <room-token>
       name: Hermes ↔ User
 ```
 
-### 3. Перезапустите gateway
+### 3. Restart the gateway
 
 ```bash
 hermes gateway restart
@@ -65,77 +65,77 @@ hermes gateway restart
 
 ### 4. Pairing
 
-Первое сообщение пользователя вернёт код подтверждения:
+The user's first message returns a confirmation code:
 
 ```bash
 hermes pairing approve talk <CODE>
 ```
 
-## Создание App Password
+## Creating an App Password
 
-Nextcloud → **Настройки → Безопасность → Устройства и сессии** → «Создать новый пароль приложения». Используйте этот пароль (не основной!) в `app_password`.
+Nextcloud → **Settings → Security → Devices & sessions** → "Create new app password". Use this password (not your main one!) as `app_password`.
 
-Токен комнаты можно получить из URL комнаты в веб-интерфейсе Talk: `https://nc.example.com/call/<token>`.
+The room token is the last segment of the room URL in the Talk web UI: `https://nc.example.com/call/<token>`.
 
-## Архитектура / протокол
+## Architecture / protocol
 
 ```
 Hermes gateway ──listen──▶ GET /ocs/v2.php/apps/spreed/api/v1/chat/{token}
                            ?lookIntoFuture=1&lastKnownMessageId=N (long-poll 30s)
         │
-        └──send───▶ POST /chat/{token}                                  (текст)
+        └──send───▶ POST /chat/{token}                                  (text)
                     POST /chat/{token}/attachment/folder                (probe Draft)
-                    WebDAV PUT /Draft/<uuid>.<ext>                      (файл)
+                    WebDAV PUT /Draft/<uuid>.<ext>                      (file)
                     POST /chat/{token}/attachment                       (media+caption)
 ```
 
-### Нюансы, обнаруженные при разработке
+### Gotchas discovered during development
 
-- **Voice-message mime:** Talk принимает `messageType: voice-message` только для `audio/mpeg` и `audio/wav`. OGG (opus) молча теряет метку и рендерится большим файловым плеером → адаптер конвертирует OGG → MP3 64k через ffmpeg.
-- **`referenceId` обязателен** для attachment endpoint — без него HTTP 400.
-- **`home_channel`** должен содержать ровно `{platform, chat_id, name}` — иначе gateway падает при старте (`KeyError: 'platform'` в `HomeChannel.from_dict`). Проверено crash-loop'ом.
-- **Pairing** обязателен: без одобрения сообщения пользователя игнорируются (`Unauthorized user` в логе).
+- **Voice-message mime:** Talk only accepts `messageType: voice-message` for `audio/mpeg` and `audio/wav`. OGG (opus) silently loses the label and renders as a large file player → the adapter converts OGG → MP3 64k via ffmpeg.
+- **`referenceId` is required** for the attachment endpoint — without it you get HTTP 400.
+- **`home_channel`** must contain exactly `{platform, chat_id, name}` — otherwise the gateway crashes on startup (`KeyError: 'platform'` in `HomeChannel.from_dict`). Verified by an actual crash-loop.
+- **Pairing is mandatory:** without approval, user messages are ignored (`Unauthorized user` in the log).
 
-## Конфигурация через переменные окружения
+## Environment variables
 
-| Переменная | Описание |
+| Variable | Description |
 |---|---|
-| `TALK_SERVER_URL` | Базовый URL Nextcloud |
-| `TALK_USER` | Пользователь бота |
+| `TALK_SERVER_URL` | Nextcloud base URL |
+| `TALK_USER` | Bot user |
 | `TALK_APP_PASSWORD` | App password |
-| `TALK_ROOM_TOKEN` | Комната по умолчанию |
-| `TALK_HOME_CHANNEL` | Комната для cron-доставки |
-| `TALK_POLL_INTERVAL` | Секунды между опросами (по умолчанию 2) |
+| `TALK_ROOM_TOKEN` | Default room |
+| `TALK_HOME_CHANNEL` | Room for cron delivery |
+| `TALK_POLL_INTERVAL` | Seconds between polls (default 2) |
 
-## Ограничения
+## Limitations
 
-- Голосовые **отправляются** (upload), но входящие voice-сообщения пока приходят как текст-заглушка — расшифровку можно подключить через [faster-whisper](https://github.com/SYSTRAN/faster-whisper) отдельно.
-- Нет реакций/тредов (Talk API их отдаёт, адаптер пока не маппит).
-- 1 long-poll на комнату: много комнат = больше открытых соединений.
+- Voice messages are **sent** (upload) fine, but incoming voice messages arrive as a text placeholder — transcription can be added separately via [faster-whisper](https://github.com/SYSTRAN/faster-whisper).
+- No reactions/threads (Talk API provides them; the adapter doesn't map them yet).
+- One long-poll per room: many rooms = more open connections.
 
-## Отладка
+## Debugging
 
 ```bash
 tail -f ~/.hermes/logs/gateway.log | grep -i talk
 hermes gateway status
 ```
 
-Типовые проблемы:
+Common issues:
 
-| Симптом | Причина |
+| Symptom | Cause |
 |---|---|
-| Gateway не стартует, `KeyError: 'platform'` | Невалидный `home_channel` — см. раздел Установка |
-| `Unauthorized user` в логе | Нужен `hermes pairing approve talk <CODE>` |
-| Голосовое отображается как файл | Старая версия Talk (<17) без attachment API |
-| `talk connected`, но сообщений нет | Проверьте, что пишете в комнату из `room_token` |
+| Gateway won't start, `KeyError: 'platform'` | Invalid `home_channel` — see Installation |
+| `Unauthorized user` in the log | Run `hermes pairing approve talk <CODE>` |
+| Voice message renders as a file | Old Talk version (<17) without the attachment API |
+| `talk connected` but no messages arrive | Make sure you're writing to the room from `room_token` |
 
-## Требования
+## Requirements
 
 - Hermes Agent
 - Nextcloud + Talk ≥ 17 (attachment API)
-- Python: `httpx` (уже входит в Hermes)
-- Системно: `ffmpeg` (для конвертации голосовых)
+- Python: `httpx` (already a Hermes dependency)
+- System: `ffmpeg` (for voice conversion)
 
-## Лицензия
+## License
 
 [MIT](LICENSE) © 2026 Vadim Surpin

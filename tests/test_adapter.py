@@ -1,8 +1,8 @@
-"""Тесты адаптера Nextcloud Talk (запуск: pytest -v tests/).
+"""Tests for the Nextcloud Talk adapter (run: pytest -v tests/).
 
-Требуют живого Nextcloud — задайте переменные окружения:
+Requires a live Nextcloud instance — set these environment variables:
   TALK_TEST_SERVER, TALK_TEST_USER, TALK_TEST_PASSWORD, TALK_TEST_ROOM
-Без них интеграционные тесты пропускаются (skip).
+Without them, integration tests are skipped.
 """
 import asyncio
 import os
@@ -18,7 +18,7 @@ from adapter import NextcloudTalkAdapter, _guess_ctype  # noqa: E402
 HAS_CREDS = all(os.getenv(v) for v in (
     "TALK_TEST_SERVER", "TALK_TEST_USER", "TALK_TEST_PASSWORD", "TALK_TEST_ROOM"))
 
-pytestmark = pytest.mark.skipif(not HAS_CREDS, reason="TALK_TEST_* env не заданы")
+pytestmark = pytest.mark.skipif(not HAS_CREDS, reason="TALK_TEST_* env not set")
 
 
 def make_adapter():
@@ -32,7 +32,7 @@ def make_adapter():
     return NextcloudTalkAdapter(cfg, Platform("talk"))
 
 
-# ---------- unit (без сети) ----------
+# ---------- unit (no network) ----------
 
 def test_guess_ctype():
     assert _guess_ctype("a.ogg") == "audio/ogg"
@@ -41,7 +41,7 @@ def test_guess_ctype():
     assert _guess_ctype("d.xyz") == "application/octet-stream"
 
 
-# ---------- integration (живой Nextcloud) ----------
+# ---------- integration (live Nextcloud) ----------
 
 def test_connect_disconnect():
     a = make_adapter()
@@ -53,17 +53,17 @@ def test_send_text():
     a = make_adapter()
     asyncio.run(a.connect())
     room = os.environ["TALK_TEST_ROOM"]
-    r = asyncio.run(a.send(room, "pytest: тест отправки ✅"))
+    r = asyncio.run(a.send(room, "pytest: send test ✅"))
     asyncio.run(a.disconnect())
     assert r.success
 
 
 def test_send_voice_creates_voice_message():
-    """Главный контракт: mimeType mp3 + talkMetaData → messageType=voice-message."""
+    """Key contract: mimeType mp3 + talkMetaData → messageType=voice-message."""
     a = make_adapter()
     asyncio.run(a.connect())
     room = os.environ["TALK_TEST_ROOM"]
-    # Генерируем 1-сек mp3 если нет готового
+    # Generate a 1-second mp3 if no fixture exists
     import subprocess, tempfile
     tmp = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
     tmp.close()
@@ -73,8 +73,8 @@ def test_send_voice_creates_voice_message():
     asyncio.run(a.disconnect())
     assert r.success
 
-    # Проверяем последнее сообщение
-    import re, json, urllib.request, base64
+    # Verify the last message
+    import json, urllib.request, base64
     pwd = os.environ["TALK_TEST_PASSWORD"]
     b64 = base64.b64encode(f"{os.environ['TALK_TEST_USER']}:{pwd}".encode()).decode()
     req = urllib.request.Request(
@@ -84,7 +84,7 @@ def test_send_voice_creates_voice_message():
                  "Authorization": "Basic " + b64})
     d = json.load(urllib.request.urlopen(req, timeout=20))
     last = d["ocs"]["data"][0]
-    assert last["messageType"] == "voice-message", f"ожидался voice-message, получен {last['messageType']}"
+    assert last["messageType"] == "voice-message", f"expected voice-message, got {last['messageType']}"
 
 
 def test_send_file_image_with_caption():

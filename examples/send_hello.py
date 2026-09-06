@@ -1,6 +1,6 @@
-"""Пример standalone-использования адаптера (без gateway).
+"""Standalone adapter usage example (without the gateway).
 
-Запуск:
+Run:
     TALK_SERVER_URL=https://nc.example.com \
     TALK_USER=hermes TALK_APP_PASSWORD=xxx \
     TALK_ROOM_TOKEN=abcd1234 \
@@ -35,13 +35,13 @@ async def main():
 
     room = os.environ["TALK_ROOM_TOKEN"]
 
-    # Текст
-    r = await adapter.send(room, "👋 Привет из standalone-примера!")
+    # Text
+    r = await adapter.send(room, "👋 Hello from the standalone example!")
     print("text:", r.success)
 
-    # Голосовое (если есть ffmpeg и ogg-файл)
+    # Voice message (if ffmpeg and an ogg file are provided)
     if len(sys.argv) > 1 and os.path.exists(sys.argv[1]):
-        r = await adapter.send_voice(room, sys.argv[1], caption="🎙 Пример голосового")
+        r = await adapter.send_voice(room, sys.argv[1], caption="🎙 Voice example")
         print("voice:", r.success)
 
     await adapter.disconnect()

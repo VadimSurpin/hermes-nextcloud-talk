@@ -29,7 +29,7 @@ log = logging.getLogger(__name__)
 API_V1 = "/ocs/v2.php/apps/spreed/api/v1"
 API_V4 = "/ocs/v2.php/apps/spreed/api/v4"
 MAX_MESSAGE_LENGTH = 32000
-TALK_FILES_DIR = "Talk"          # Files/Talk — хранилище вложений чата
+TALK_FILES_DIR = "Talk"          # Files/Talk — chat attachment storage
 
 
 def _env(name: str, default: str = "") -> str:
@@ -80,14 +80,14 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         if not HTTPX_AVAILABLE:
-            log.error("httpx не установлен — Talk adapter недоступен")
+            log.error("httpx not installed — Talk adapter unavailable")
             return False
         if not (self.server and self.user and self.password):
-            log.error("TALK_SERVER_URL / TALK_USER / TALK_APP_PASSWORD не заданы")
+            log.error("TALK_SERVER_URL / TALK_USER / TALK_APP_PASSWORD not set")
             return False
         self._client = httpx.AsyncClient(timeout=httpx.Timeout(65.0))
         rooms = await self._get(f"{API_V4}/room")
-        log.info("Nextcloud Talk подключён, комнат доступно: %d", len(rooms))
+        log.info("Nextcloud Talk connected, rooms available: %d", len(rooms))
         if self.default_room:
             try:
                 hist = await self._get(f"{API_V1}/chat/{self.default_room}",
@@ -96,7 +96,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                 if last.get("id"):
                     self._last_msg_ids[self.default_room] = last["id"]
             except Exception as e:
-                log.warning("не получили last id: %s", e)
+                log.warning("failed to get last id: %s", e)
         self._running = True
         self._listen_task = asyncio.create_task(self.listen())
         return True
@@ -121,7 +121,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                 rooms = await self._get(f"{API_V4}/room")
                 poll_rooms = [r["token"] for r in rooms]
             except Exception as e:
-                log.error("не получили список комнат: %s", e)
+                log.error("failed to list rooms: %s", e)
                 poll_rooms = []
 
         while self._running:
@@ -181,7 +181,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
     # ---------- Media: files upload + share-to-chat ----------
 
     def _webdav_put_sync(self, remote_path: str, data: bytes, ctype: str) -> int:
-        """WebDAV PUT (sync; вызвать из to_thread). Возвращает HTTP-код."""
+        """WebDAV PUT (sync; call from to_thread). Returns HTTP status."""
         import base64
         cred = base64.b64encode(f"{self.user}:{self.password}".encode()).decode()
         req = urllib.request.Request(
@@ -223,7 +223,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         return 200 <= resp.status < 300
 
     async def _ensure_talk_dir(self) -> None:
-        """Создаёт Files/Talk, если нет (MKCOL idempotent)."""
+        """Creates Files/Talk if missing (MKCOL idempotent)."""
         import base64
         cred = base64.b64encode(f"{self.user}:{self.password}".encode()).decode()
         req = urllib.request.Request(
@@ -234,21 +234,21 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             await asyncio.get_event_loop().run_in_executor(
                 None, lambda: urllib.request.urlopen(req, timeout=20).read())
         except Exception:
-            pass  # 405 = уже существует
+            pass  # 405 = already exists
 
     async def send_file(self, chat_id: str, file_path: str,
                         caption: Optional[str] = None,
                         reply_to: Optional[str] = None,
                         metadata: Optional[Dict[str, Any]] = None) -> SendResult:
-        """Медиа/файл: Draft-folder → WebDAV → attachment endpoint
-        (caption внутри talkMetaData — подпись на самом медиа, как в Telegram).
-        Фолбэк: WebDAV в Files/Talk + share-to-chat, подпись отдельным сообщением."""
+        """Media/file: Draft-folder → WebDAV → attachment endpoint
+        (caption inside talkMetaData — caption on the media itself, like Telegram).
+        Fallback: WebDAV to Files/Talk + share-to-chat, caption as a separate message."""
         loop = asyncio.get_event_loop()
         try:
             data = await loop.run_in_executor(None, lambda: open(file_path, "rb").read())
             fname = os.path.basename(file_path)
 
-            # Основной путь: attachment endpoint (caption на медиа)
+            # Primary path: attachment endpoint (caption on media)
             try:
                 code, r = await loop.run_in_executor(None, lambda: self._ocs_api_raw(
                     f"{API_V1}/chat/{chat_id}/attachment/folder", {"fileNames": [fname]}))
@@ -270,11 +270,11 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                         }))
                     if code2 == 200:
                         return SendResult(success=True)
-                    log.warning("[talk] attachment %s — фолбэк share-as-file", code2)
+                    log.warning("[talk] attachment %s — falling back to share-as-file", code2)
             except Exception as e:
-                log.warning("[talk] attachment path failed: %s — фолбэк", e)
+                log.warning("[talk] attachment path failed: %s — fallback", e)
 
-            # Фолбэк: Files/Talk + share-to-chat
+            # Fallback: Files/Talk + share-to-chat
             await self._ensure_talk_dir()
             stamp = int(time.time())
             safe = f"{stamp}_{fname}"
@@ -297,15 +297,15 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                          reply_to: Optional[str] = None,
                          metadata: Optional[Dict[str, Any]] = None,
                          **kwargs) -> SendResult:
-        """Нативное voice-message (компактный waveform-плеер).
-        Talk принимает метку voice-message только для audio/mpeg | audio/wav,
-        поэтому OGG конвертируется в MP3 (ffmpeg). Фолбэк — share-as-file."""
+        """Native voice-message (compact waveform player).
+        Talk only accepts the voice-message label for audio/mpeg | audio/wav,
+        so OGG is converted to MP3 (ffmpeg). Fallback: share-as-file."""
         loop = asyncio.get_event_loop()
         try:
             send_path = audio_path
             ext = os.path.splitext(audio_path)[1].lower()
             if ext not in (".mp3", ".wav"):
-                # конвертация в mp3 (voice-message допускает только mpeg/wav)
+                # convert to mp3 (voice-message only allows mpeg/wav)
                 import subprocess, tempfile
                 tmp = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
                 tmp.close()
@@ -316,7 +316,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                 if proc.returncode == 0 and os.path.getsize(tmp.name) > 0:
                     send_path = tmp.name
                 else:
-                    log.warning("[talk] ffmpeg convert failed — шлём как есть")
+                    log.warning("[talk] ffmpeg convert failed — sending as-is")
 
             data = await loop.run_in_executor(None, lambda: open(send_path, "rb").read())
             fname = os.path.basename(send_path) or "voice.mp3"
@@ -328,12 +328,12 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                 raise RuntimeError(f"probe folder {code}")
             folder = r["ocs"]["data"]["folder"]
 
-            # 2) upload в Draft под uuid
+            # 2) upload to Draft under a uuid
             tmp_name = f"{uuid.uuid4().hex}{os.path.splitext(send_path)[1]}"
             await loop.run_in_executor(None, lambda: self._webdav_put_sync(
                 f"/{folder}/{tmp_name}", data, "audio/mpeg"))
 
-            # 3) attachment с voice-message меткой
+            # 3) attachment with the voice-message label
             meta: Dict[str, Any] = {"messageType": "voice-message"}
             if caption:
                 meta["caption"] = caption[:1000]
@@ -351,10 +351,10 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                     pass
             if code == 200:
                 return SendResult(success=True)
-            log.warning("[talk] attachment %s — фолбэк на share-as-file", code)
+            log.warning("[talk] attachment %s — falling back to share-as-file", code)
             return await self.send_file(chat_id, audio_path, caption=caption)
         except Exception as e:
-            log.warning("[talk] send_voice error: %s — фолбэк на share-as-file", e)
+            log.warning("[talk] send_voice error: %s — falling back to share-as-file", e)
             return await self.send_file(chat_id, audio_path, caption=caption)
 
     def _ocs_api_raw(self, path: str, payload: Dict):
@@ -440,7 +440,7 @@ def register(ctx) -> None:
         validate_config=validate_config,
         is_connected=is_connected,
         required_env=["TALK_SERVER_URL", "TALK_USER", "TALK_APP_PASSWORD"],
-        install_hint="pip install httpx   # уже зависимость Hermes",
+        install_hint="pip install httpx   # already a Hermes dependency",
         env_enablement_fn=_env_enablement,
         cron_deliver_env_var="TALK_HOME_CHANNEL",
         standalone_sender_fn=_standalone_send,
@@ -448,7 +448,7 @@ def register(ctx) -> None:
         emoji="💬",
         allow_update_command=True,
         platform_hint=(
-            "Ты общаешься через Nextcloud Talk (комнатный токен = chat_id). "
-            "Отвечай компактно. Голосовые ответы доставляются как аудио-файлы."
+            "You are communicating via Nextcloud Talk (room token = chat_id). "
+            "Keep responses concise. Voice replies are delivered as audio attachments."
         ),
     )

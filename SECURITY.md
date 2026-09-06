@@ -1,28 +1,28 @@
-# Безопасность
+# Security Policy
 
-## Поддерживаемые версии
+## Supported versions
 
-| Версия | Поддержка |
+| Version | Supported |
 |---|---|
 | 1.0.x | ✅ |
 
-## Рекомендации по безопасной настройке
+## Configuration recommendations
 
-1. **App password, не основной пароль.** Создайте отдельный пароль приложения (Настройки → Безопасность) с минимальными правами. При компрометации его можно отозвать, не меняя основной пароль.
+1. **App password, not your main password.** Create a dedicated app password (Settings → Security) with minimal scope. If compromised, it can be revoked without changing the main password.
 
-2. **Приватный сервер.** Адаптер ходит на ваш Nextcloud с полными правами пользователя `hermes`. Не указывайте в `TALK_SERVER_URL` публичные серверы, которым не доверяете.
+2. **Private server.** The adapter talks to your Nextcloud with full rights of the `hermes` user. Don't point `TALK_SERVER_URL` at public servers you don't control.
 
-3. **Pairing обязателен.** Не отключайте механизм pairing: без подтверждения (`hermes pairing approve talk <CODE>`) сообщения любых пользователей игнорируются.
+3. **Pairing is mandatory.** Do not bypass the pairing mechanism: without approval (`hermes pairing approve talk <CODE>`), all user messages are ignored.
 
-4. **Allowlist комнат.** Адаптер опрашивает комнаты из `room_token`/`home_channel`. Не добавляйте в конфиг публичные комнаты — любой участник сможетtriggerить агента.
+4. **Room allowlist.** The adapter polls rooms from `room_token`/`home_channel`. Don't add public rooms — any participant would be able to trigger the agent.
 
-5. **Секреты не в git.** `app_password` и токены не хранятся в репозитории; README примеры используют placeholder'ы.
+5. **No secrets in git.** `app_password` and tokens are never stored in the repository; README examples use placeholders.
 
-## Передача уязвимостей
+## Reporting a vulnerability
 
-Нашли уязвимость — **не создавайте публичный issue**. Напишите владельцу репозитория напрямую (см. профиль GitHub), приложив описание и шаги воспроизведения. Ответ в течение 72 часов.
+Found a security issue — **please do not open a public issue**. Contact the repository owner directly (see GitHub profile) with a description and reproduction steps. Expect a response within 72 hours.
 
-## Известные ограничения
+## Known limitations
 
-- Адаптер выполняет действия от имени пользователя `hermes`: сообщения, файлы, шеры видны как его активность в аудите Nextcloud.
-- Файлы вложений складываются в `Files/Talk/<room>-subfolder` и доступны всем участникам комнаты.
+- The adapter performs actions as the `hermes` user: messages, files, and shares appear as its activity in the Nextcloud audit log.
+- Attachment files are stored in `Files/Talk/<room>-subfolder` and are visible to all room participants.

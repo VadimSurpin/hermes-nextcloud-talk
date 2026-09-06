@@ -1,23 +1,23 @@
 # Contributing
 
-Спасибо за интерес к проекту!
+Thanks for your interest in this project!
 
-## Как помочь
+## How to help
 
-- **Баги:** откройте issue с логом `gateway.log` (фрагмент вокруг ошибки), версией Nextcloud/Talk и шагами воспроизведения.
-- **Фичи:** сначала issue с описанием сценария — обсудим дизайн до кода.
-- **PR:** форк → ветка `feat/<имя>` → PR. Держите изменения атомарными.
+- **Bugs:** open an issue with a `gateway.log` excerpt (around the error), your Nextcloud/Talk versions, and reproduction steps.
+- **Features:** start with an issue describing the use case — let's discuss the design before the code.
+- **PRs:** fork → branch `feat/<name>` → PR. Keep changes atomic.
 
-## Среда разработки
+## Development setup
 
 ```bash
-# Структура плагина Hermes
+# Hermes plugin layout
 ~/.hermes/plugins/nextcloud-talk/
 ├── __init__.py     # from .adapter import register
 ├── adapter.py
 └── plugin.yaml
 
-# Быстрый smoke-тест вне gateway
+# Quick smoke test outside the gateway
 import sys; sys.path.insert(0, '/opt/hermes')
 from hermes_cli.plugins import discover_plugins
 discover_plugins()
@@ -25,21 +25,21 @@ from gateway.platform_registry import platform_registry
 adapter = platform_registry.create_adapter('talk', config)
 ```
 
-## Стиль кода
+## Code style
 
-- Python 3.12+, type hints приветствуются
-- Логи через модульный `logging.getLogger(__name__)`
-- Все вызовы OCS API — через `_get`/`_post`/`_ocs_api_raw` (единая auth-обработка)
-- Блокирующие операции (WebDAV, ffmpeg) — только через `run_in_executor`
+- Python 3.12+, type hints welcome
+- Logging via module-level `logging.getLogger(__name__)`
+- All OCS API calls go through `_get`/`_post`/`_ocs_api_raw` (unified auth handling)
+- Blocking operations (WebDAV, ffmpeg) — only via `run_in_executor`
 
-## Тест-чеклист перед PR
+## Pre-PR test checklist
 
-- [ ] Текст: отправка и приём (long-poll ловит сообщение другого пользователя)
-- [ ] Голосовое OGG → компактный waveform-плеер (проверить `messageType: voice-message` в истории)
-- [ ] Картинка/видео с caption — подпись на медиа, одним сообщением
-- [ ] Фолбэк share-as-file не ломается при отключённом attachment API
-- [ ] `hermes gateway restart` проходит без `KeyError: 'platform'`
+- [ ] Text: send and receive (long-poll picks up another user's message)
+- [ ] Voice OGG → compact waveform player (verify `messageType: voice-message` in history)
+- [ ] Image/video with caption — caption on the media, single message
+- [ ] Share-as-file fallback doesn't break when the attachment API is disabled
+- [ ] `hermes gateway restart` completes without `KeyError: 'platform'`
 
-## Коммиты
+## Commits
 
-Conventional Commits: `feat:`, `fix:`, `docs:`, `refactor:` — на русском или английском.
+Conventional Commits: `feat:`, `fix:`, `docs:`, `refactor:` — English preferred.
