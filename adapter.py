@@ -157,7 +157,17 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                             user_name=m.get("actorDisplayName") or actor,
                             message_id=str(mid),
                             raw_message=m,
+                            reply_to_message_id=(
+                                str(m["replyTo"]) if m.get("replyTo") else None),
                         )
+                        # Talk-specific extras for downstream handlers
+                        ev_metadata = {
+                            "room": token,
+                            "thread_id": m.get("threadId"),
+                            "reactions": m.get("reactions") or {},
+                            "expiration": m.get("expirationTimestamp"),
+                        }
+                        ev.metadata = ev_metadata
                         await self.handle_message(ev)
                 except httpx.HTTPStatusError as e:
                     if e.response.status_code not in (304, 404):
@@ -169,14 +179,52 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
     async def send(self, chat_id: str, content: str,
                    reply_to: Optional[str] = None,
                    metadata: Optional[Dict[str, Any]] = None) -> SendResult:
+        """Send text. metadata supports: thread_id (reply in thread),
+        thread_title (create a new thread), silent."""
         try:
             payload: Dict[str, Any] = {"message": content[:MAX_MESSAGE_LENGTH]}
             if reply_to:
                 payload["replyTo"] = int(reply_to)
+            md = metadata or {}
+            if md.get("thread_id"):
+                payload["threadId"] = int(md["thread_id"])
+            if md.get("thread_title"):
+                payload["threadTitle"] = str(md["thread_title"])[:64]
+            if md.get("silent"):
+                payload["silent"] = True
             await self._post(f"{API_V1}/chat/{chat_id}", payload)
             return SendResult(success=True)
         except Exception as e:
             return SendResult(success=False, error=str(e))
+
+    # ---------- Reactions ----------
+
+    async def react(self, chat_id: str, message_id: str,
+                    emoji: str) -> SendResult:
+        """Add a reaction to a message (POST /reaction/{token}/{messageId})."""
+        try:
+            await self._post(f"{API_V1}/reaction/{chat_id}/{int(message_id)}",
+                             {"reaction": emoji})
+            return SendResult(success=True)
+        except Exception as e:
+            return SendResult(success=False, error=str(e))
+
+    async def unreact(self, chat_id: str, message_id: str,
+                      emoji: str) -> SendResult:
+        """Remove a reaction (DELETE /reaction/{token}/{messageId})."""
+        try:
+            r = await self._client.delete(
+                self._url(f"{API_V1}/reaction/{chat_id}/{int(message_id)}"),
+                json={"reaction": emoji}, headers=self._headers())
+            r.raise_for_status()
+            return SendResult(success=True)
+        except Exception as e:
+            return SendResult(success=False, error=str(e))
+
+    async def get_reactions(self, chat_id: str, message_id: str) -> Dict[str, List[Dict]]:
+        """Reactions of a message: {emoji: [{actorId, actorDisplayName, ...}]}."""
+        data = await self._get(f"{API_V1}/reaction/{chat_id}/{int(message_id)}")
+        return data if isinstance(data, dict) else {}
 
     # ---------- Media: files upload + share-to-chat ----------
 
