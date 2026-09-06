@@ -1,0 +1,37 @@
+---
+name: nextcloud-talk-platform
+label: Nextcloud Talk
+kind: platform
+version: 1.0.0
+description: >
+  Nextcloud Talk gateway adapter for Hermes Agent. Polls the Talk chat API
+  (OCS /chat/{token}, lookIntoFuture long-poll) and sends replies via POST.
+  Pure httpx — no external SDK. Room-based identity: the Talk room token is
+  the chat_id; a read-only app-password user (Hermes) is the trust boundary.
+author: Hermes Agent
+requires_env:
+  - name: TALK_SERVER_URL
+    description: "Nextcloud base URL"
+    prompt: "Nextcloud URL"
+    password: false
+  - name: TALK_USER
+    description: "Nextcloud user for bot (e.g. hermes)"
+    prompt: "Talk user"
+    password: false
+  - name: TALK_APP_PASSWORD
+    description: "Nextcloud app password"
+    prompt: "App password"
+    password: true
+optional_env:
+  - name: TALK_ROOM_TOKEN
+    description: "Default room token for conversations (e.g. rpsvaqfi)"
+    prompt: "Default room token"
+    password: false
+  - name: TALK_HOME_CHANNEL
+    description: "Room token for cron / notification delivery"
+    prompt: "Home room token"
+    password: false
+  - name: TALK_POLL_INTERVAL
+    description: "Seconds between polls when no long-poll wait (default 2)"
+    prompt: "Poll interval seconds"
+    password: false
