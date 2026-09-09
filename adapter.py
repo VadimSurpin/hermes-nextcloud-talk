@@ -200,27 +200,27 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             except Exception as e:
                 log.error("failed to list rooms: %s", e)
 
-        while self._running:
-            # --- пересбор списка комнат: новые комнаты получают свой task ---
-            now = time.time()
-            if not self.default_room and now >= self._rooms_refresh_at:
-                try:
-                    rooms = await self._get(f"{API_V4}/room")
-                    self._spawn_room_tasks([r["token"] for r in rooms])
-                    self._rooms_refresh_at = now + rooms_refresh_interval
-                except Exception as e:
-                    log.error("failed to list rooms: %s", e)
-                    self._rooms_refresh_at = now + 15.0
-            await asyncio.sleep(2)
-
-        # остановка: все room-таски
-        for t in self._room_tasks.values():
-            t.cancel()
-        for t in self._room_tasks.values():
-            try:
-                await t
-            except asyncio.CancelledError:
-                pass
+        try:
+            while self._running:
+                # --- пересбор списка комнат: новые комнаты получают свой task ---
+                now = time.time()
+                if not self.default_room and now >= self._rooms_refresh_at:
+                    try:
+                        rooms = await self._get(f"{API_V4}/room")
+                        self._spawn_room_tasks([r["token"] for r in rooms])
+                        self._rooms_refresh_at = now + rooms_refresh_interval
+                    except Exception as e:
+                        log.error("failed to list rooms: %s", e)
+                        self._rooms_refresh_at = now + 15.0
+                await asyncio.sleep(2)
+        finally:
+            # остановка ЛЮБЫМ путём: _running=False, cancel listen, ошибка —
+            # все room-таски отменяются гарантированно (никаких зависаний)
+            for t in self._room_tasks.values():
+                t.cancel()
+            if self._room_tasks:
+                await asyncio.gather(*self._room_tasks.values(), return_exceptions=True)
+            self._room_tasks.clear()
 
     async def send(self, chat_id: str, content: str,
                    reply_to: Optional[str] = None,
