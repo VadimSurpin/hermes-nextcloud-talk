@@ -53,7 +53,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         self._running = False
         self._listen_task: Optional[asyncio.Task] = None
         self._rooms_refresh_at = 0.0               # когда пересобрать список комнат
-        self._error_streak = 0                     # подряд идущие ошибки поллинга
+        self._room_tasks: Dict[str, asyncio.Task] = {}  # token -> task (параллельный поллинг)
 
     # ---------- HTTP helpers ----------
 
@@ -117,90 +117,110 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             await self._client.aclose()
             self._client = None
 
+    async def _poll_room_forever(self, token: str) -> None:
+        """Долгий поллинг одной комнаты: параллельно с другими комнатами.
+        Каждая комната держит СВОЙ long-poll — задержка не растёт с числом комнат."""
+        streak = 0
+        while self._running:
+            try:
+                params = {"lookIntoFuture": 1, "limit": 30, "timeout": 30}
+                last = self._last_msg_ids.get(token)
+                if last:
+                    params["lastKnownMessageId"] = last
+                data = await self._get(f"{API_V1}/chat/{token}", params)
+                streak = 0
+                msgs = data if isinstance(data, list) else []
+                for m in msgs:
+                    mid = m.get("id", 0)
+                    self._last_msg_ids[token] = max(self._last_msg_ids.get(token, 0), mid)
+                    if m.get("actorId") == self.user:
+                        continue
+                    processed = self._processed_ids.setdefault(token, set())
+                    if mid in processed:
+                        continue
+                    processed.add(mid)
+                    if len(processed) > 500:
+                        self._processed_ids[token] = set(sorted(processed)[-200:])
+                    mtype = MessageType.VOICE if m.get("messageType") == "voice-message" else MessageType.TEXT
+                    actor = m.get("actorId") or "unknown"
+                    source = self.build_source(
+                        chat_id=token, chat_name=token, chat_type="dm",
+                        user_id=actor, user_name=m.get("actorDisplayName") or actor,
+                    )
+                    ev = MessageEvent(
+                        text=m.get("message") or "",
+                        message_type=mtype,
+                        source=source,
+                        user_id=actor,
+                        user_name=m.get("actorDisplayName") or actor,
+                        message_id=str(mid),
+                        raw_message=m,
+                        reply_to_message_id=(str(m["replyTo"]) if m.get("replyTo") else None),
+                    )
+                    ev.metadata = {
+                        "room": token,
+                        "thread_id": m.get("threadId"),
+                        "reactions": m.get("reactions") or {},
+                        "expiration": m.get("expirationTimestamp"),
+                    }
+                    await self.handle_message(ev)
+            except asyncio.CancelledError:
+                raise
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code not in (304, 404):
+                    log.warning("poll %s: %s", token, e)
+                    streak += 1
+            except Exception as e:
+                log.warning("poll %s: %s", token, e)
+                streak += 1
+            # backoff: обычно сразу снова long-poll (~32 с сам по себе),
+            # но после ошибок — экспоненциальная пауза
+            if streak:
+                delay = min(self.poll_interval * (2 ** min(streak, 6)), 300.0)
+                await asyncio.sleep(delay)
+            # иначе — немедленно следующий long-poll
+
+    def _spawn_room_tasks(self, tokens: list) -> None:
+        """Создаёт task на каждую новую комнату (существующие не трогаем)."""
+        for token in tokens:
+            if token not in self._room_tasks or self._room_tasks[token].done():
+                self._room_tasks[token] = asyncio.create_task(
+                    self._poll_room_forever(token))
+
     async def listen(self) -> None:
         rooms_refresh_interval = 300.0   # пересобирать список комнат раз в 5 минут
 
+        # стартовый набор: default_room или список комнат
+        if self.default_room:
+            self._spawn_room_tasks([self.default_room])
+        else:
+            try:
+                rooms = await self._get(f"{API_V4}/room")
+                self._spawn_room_tasks([r["token"] for r in rooms])
+            except Exception as e:
+                log.error("failed to list rooms: %s", e)
+
         while self._running:
-            # --- пересбор списка комнат (раз в N секунд) ---
+            # --- пересбор списка комнат: новые комнаты получают свой task ---
             now = time.time()
             if not self.default_room and now >= self._rooms_refresh_at:
                 try:
                     rooms = await self._get(f"{API_V4}/room")
-                    self._poll_rooms = [r["token"] for r in rooms]
+                    self._spawn_room_tasks([r["token"] for r in rooms])
                     self._rooms_refresh_at = now + rooms_refresh_interval
                 except Exception as e:
                     log.error("failed to list rooms: %s", e)
-                    self._rooms_refresh_at = now + 15.0  # скоро повторить
-            poll_rooms = [self.default_room] if self.default_room else getattr(self, "_poll_rooms", [])
+                    self._rooms_refresh_at = now + 15.0
+            await asyncio.sleep(2)
 
-            had_error = False
-            for token in poll_rooms:
-                if not self._running:
-                    break
-                try:
-                    params = {"lookIntoFuture": 1, "limit": 30, "timeout": 30}
-                    last = self._last_msg_ids.get(token)
-                    if last:
-                        params["lastKnownMessageId"] = last
-                    data = await self._get(f"{API_V1}/chat/{token}", params)
-                    msgs = data if isinstance(data, list) else []
-                    for m in msgs:
-                        mid = m.get("id", 0)
-                        self._last_msg_ids[token] = max(self._last_msg_ids.get(token, 0), mid)
-                        if m.get("actorId") == self.user:
-                            continue
-                        # идемпотентность: не обрабатывать одно сообщение дважды
-                        processed = self._processed_ids.setdefault(token, set())
-                        if mid in processed:
-                            continue
-                        processed.add(mid)
-                        if len(processed) > 500:
-                            self._processed_ids[token] = set(sorted(processed)[-200:])
-                        mtype = MessageType.VOICE if m.get("messageType") == "voice-message" else MessageType.TEXT
-                        actor = m.get("actorId") or "unknown"
-                        source = self.build_source(
-                            chat_id=token,
-                            chat_name=token,
-                            chat_type="dm",
-                            user_id=actor,
-                            user_name=m.get("actorDisplayName") or actor,
-                        )
-                        ev = MessageEvent(
-                            text=m.get("message") or "",
-                            message_type=mtype,
-                            source=source,
-                            user_id=actor,
-                            user_name=m.get("actorDisplayName") or actor,
-                            message_id=str(mid),
-                            raw_message=m,
-                            reply_to_message_id=(
-                                str(m["replyTo"]) if m.get("replyTo") else None),
-                        )
-                        # Talk-specific extras for downstream handlers
-                        ev_metadata = {
-                            "room": token,
-                            "thread_id": m.get("threadId"),
-                            "reactions": m.get("reactions") or {},
-                            "expiration": m.get("expirationTimestamp"),
-                        }
-                        ev.metadata = ev_metadata
-                        await self.handle_message(ev)
-                except httpx.HTTPStatusError as e:
-                    if e.response.status_code not in (304, 404):
-                        log.warning("poll %s: %s", token, e)
-                        had_error = True
-                except Exception as e:
-                    log.warning("poll %s: %s", token, e)
-                    had_error = True
-
-            # --- backoff при недоступном сервере ---
-            if had_error:
-                self._error_streak += 1
-                delay = min(self.poll_interval * (2 ** min(self._error_streak, 6)), 300.0)
-            else:
-                self._error_streak = 0
-                delay = self.poll_interval
-            await asyncio.sleep(delay)
+        # остановка: все room-таски
+        for t in self._room_tasks.values():
+            t.cancel()
+        for t in self._room_tasks.values():
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
 
     async def send(self, chat_id: str, content: str,
                    reply_to: Optional[str] = None,
