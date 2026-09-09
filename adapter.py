@@ -49,8 +49,11 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         self.poll_interval = float(_env("TALK_POLL_INTERVAL") or extra.get("poll_interval") or 2)
         self._client: Optional[httpx.AsyncClient] = None
         self._last_msg_ids: Dict[str, int] = {}
+        self._processed_ids: Dict[str, set] = {}   # chat -> set(msg ids) для идемпотентности
         self._running = False
         self._listen_task: Optional[asyncio.Task] = None
+        self._rooms_refresh_at = 0.0               # когда пересобрать список комнат
+        self._error_streak = 0                     # подряд идущие ошибки поллинга
 
     # ---------- HTTP helpers ----------
 
@@ -115,16 +118,22 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             self._client = None
 
     async def listen(self) -> None:
-        poll_rooms = [self.default_room] if self.default_room else []
-        if not poll_rooms:
-            try:
-                rooms = await self._get(f"{API_V4}/room")
-                poll_rooms = [r["token"] for r in rooms]
-            except Exception as e:
-                log.error("failed to list rooms: %s", e)
-                poll_rooms = []
+        rooms_refresh_interval = 300.0   # пересобирать список комнат раз в 5 минут
 
         while self._running:
+            # --- пересбор списка комнат (раз в N секунд) ---
+            now = time.time()
+            if not self.default_room and now >= self._rooms_refresh_at:
+                try:
+                    rooms = await self._get(f"{API_V4}/room")
+                    self._poll_rooms = [r["token"] for r in rooms]
+                    self._rooms_refresh_at = now + rooms_refresh_interval
+                except Exception as e:
+                    log.error("failed to list rooms: %s", e)
+                    self._rooms_refresh_at = now + 15.0  # скоро повторить
+            poll_rooms = [self.default_room] if self.default_room else getattr(self, "_poll_rooms", [])
+
+            had_error = False
             for token in poll_rooms:
                 if not self._running:
                     break
@@ -140,6 +149,13 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                         self._last_msg_ids[token] = max(self._last_msg_ids.get(token, 0), mid)
                         if m.get("actorId") == self.user:
                             continue
+                        # идемпотентность: не обрабатывать одно сообщение дважды
+                        processed = self._processed_ids.setdefault(token, set())
+                        if mid in processed:
+                            continue
+                        processed.add(mid)
+                        if len(processed) > 500:
+                            self._processed_ids[token] = set(sorted(processed)[-200:])
                         mtype = MessageType.VOICE if m.get("messageType") == "voice-message" else MessageType.TEXT
                         actor = m.get("actorId") or "unknown"
                         source = self.build_source(
@@ -172,9 +188,19 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                 except httpx.HTTPStatusError as e:
                     if e.response.status_code not in (304, 404):
                         log.warning("poll %s: %s", token, e)
+                        had_error = True
                 except Exception as e:
                     log.warning("poll %s: %s", token, e)
-            await asyncio.sleep(self.poll_interval)
+                    had_error = True
+
+            # --- backoff при недоступном сервере ---
+            if had_error:
+                self._error_streak += 1
+                delay = min(self.poll_interval * (2 ** min(self._error_streak, 6)), 300.0)
+            else:
+                self._error_streak = 0
+                delay = self.poll_interval
+            await asyncio.sleep(delay)
 
     async def send(self, chat_id: str, content: str,
                    reply_to: Optional[str] = None,
@@ -239,6 +265,19 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         resp = urllib.request.urlopen(req, timeout=120)
         return resp.status
 
+    def _webdav_put_file(self, remote_path: str, file_path: str, ctype: str) -> int:
+        """WebDAV PUT прямо из файла — без чтения всего файла в RAM (стриминг)."""
+        import base64
+        cred = base64.b64encode(f"{self.user}:{self.password}".encode()).decode()
+        with open(file_path, "rb") as fh:
+            req = urllib.request.Request(
+                f"{self.server}/remote.php/dav/files/{self.user}{remote_path}",
+                data=fh, method="PUT",
+                headers={"Authorization": f"Basic {cred}", "Content-Type": ctype})
+            resp = urllib.request.urlopen(req, timeout=600)
+            return resp.status
+
+
     def _webdav_fileid_sync(self, remote_path: str) -> Optional[str]:
         """PROPFIND fileid (sync)."""
         import base64
@@ -279,8 +318,8 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             method="MKCOL",
             headers={"Authorization": f"Basic {cred}", "Content-Type": "application/xml"})
         try:
-            await asyncio.get_event_loop().run_in_executor(
-                None, lambda: urllib.request.urlopen(req, timeout=20).read())
+            await asyncio.to_thread(
+                lambda: urllib.request.urlopen(req, timeout=20).read())
         except Exception:
             pass  # 405 = already exists
 
@@ -291,25 +330,23 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         """Media/file: Draft-folder → WebDAV → attachment endpoint
         (caption inside talkMetaData — caption on the media itself, like Telegram).
         Fallback: WebDAV to Files/Talk + share-to-chat, caption as a separate message."""
-        loop = asyncio.get_event_loop()
         try:
-            data = await loop.run_in_executor(None, lambda: open(file_path, "rb").read())
             fname = os.path.basename(file_path)
 
             # Primary path: attachment endpoint (caption on media)
             try:
-                code, r = await loop.run_in_executor(None, lambda: self._ocs_api_raw(
+                code, r = await asyncio.to_thread(lambda: self._ocs_api_raw(
                     f"{API_V1}/chat/{chat_id}/attachment/folder", {"fileNames": [fname]}))
                 if code == 200:
                     folder = r["ocs"]["data"]["folder"]
                     tmp_name = f"{uuid.uuid4().hex}{os.path.splitext(fname)[1]}"
                     ctype = self._guess_ctype(file_path)
-                    await loop.run_in_executor(None, lambda: self._webdav_put_sync(
-                        f"/{folder}/{tmp_name}", data, ctype))
+                    await asyncio.to_thread(lambda: self._webdav_put_file(
+                        f"/{folder}/{tmp_name}", file_path, ctype))
                     meta: Dict[str, Any] = {}
                     if caption:
                         meta["caption"] = caption[:1000]
-                    code2, r2 = await loop.run_in_executor(None, lambda: self._ocs_api_raw(
+                    code2, r2 = await asyncio.to_thread(lambda: self._ocs_api_raw(
                         f"{API_V1}/chat/{chat_id}/attachment", {
                             "filePath": f"{folder}/{tmp_name}",
                             "referenceId": uuid.uuid4().hex,
@@ -328,12 +365,12 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             safe = f"{stamp}_{fname}"
             remote = f"/{TALK_FILES_DIR}/{safe}"
             ctype = self._guess_ctype(file_path)
-            status = await loop.run_in_executor(
-                None, lambda: self._webdav_put_sync(remote, data, ctype))
+            status = await asyncio.to_thread(
+                lambda: self._webdav_put_file(remote, file_path, ctype))
             if status not in (200, 201, 204):
                 return SendResult(success=False, error=f"upload http {status}")
-            await loop.run_in_executor(
-                None, lambda: self._ocs_share_to_room_sync(remote, chat_id))
+            await asyncio.to_thread(
+                lambda: self._ocs_share_to_room_sync(remote, chat_id))
             if caption:
                 await self.send(chat_id, caption[:500], reply_to=reply_to)
             return SendResult(success=True)
@@ -348,7 +385,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         """Native voice-message (compact waveform player).
         Talk only accepts the voice-message label for audio/mpeg | audio/wav,
         so OGG is converted to MP3 (ffmpeg). Fallback: share-as-file."""
-        loop = asyncio.get_event_loop()
+        tmp_converted = None
         try:
             send_path = audio_path
             ext = os.path.splitext(audio_path)[1].lower()
@@ -357,46 +394,41 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                 import subprocess, tempfile
                 tmp = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
                 tmp.close()
-                proc = await loop.run_in_executor(None, lambda: subprocess.run(
+                proc = await asyncio.to_thread(lambda: subprocess.run(
                     ["ffmpeg", "-y", "-loglevel", "error", "-i", audio_path,
                      "-codec:a", "libmp3lame", "-b:a", "64k", tmp.name],
                     capture_output=True))
                 if proc.returncode == 0 and os.path.getsize(tmp.name) > 0:
                     send_path = tmp.name
+                    tmp_converted = tmp.name
                 else:
                     log.warning("[talk] ffmpeg convert failed — sending as-is")
 
-            data = await loop.run_in_executor(None, lambda: open(send_path, "rb").read())
             fname = os.path.basename(send_path) or "voice.mp3"
 
             # 1) probe Draft folder
-            code, r = await loop.run_in_executor(None, lambda: self._ocs_api_raw(
+            code, r = await asyncio.to_thread(lambda: self._ocs_api_raw(
                 f"{API_V1}/chat/{chat_id}/attachment/folder", {"fileNames": [fname]}))
             if code != 200:
                 raise RuntimeError(f"probe folder {code}")
             folder = r["ocs"]["data"]["folder"]
 
-            # 2) upload to Draft under a uuid
+            # 2) upload to Draft under a uuid (стриминг из файла, без RAM-копии)
             tmp_name = f"{uuid.uuid4().hex}{os.path.splitext(send_path)[1]}"
-            await loop.run_in_executor(None, lambda: self._webdav_put_sync(
-                f"/{folder}/{tmp_name}", data, "audio/mpeg"))
+            await asyncio.to_thread(lambda: self._webdav_put_file(
+                f"/{folder}/{tmp_name}", send_path, "audio/mpeg"))
 
             # 3) attachment with the voice-message label
             meta: Dict[str, Any] = {"messageType": "voice-message"}
             if caption:
                 meta["caption"] = caption[:1000]
-            code, r = await loop.run_in_executor(None, lambda: self._ocs_api_raw(
+            code, r = await asyncio.to_thread(lambda: self._ocs_api_raw(
                 f"{API_V1}/chat/{chat_id}/attachment", {
-                    "filePath": f"{folder}/{tmp_name}",
+                    "filePath": f"/{folder}/{tmp_name}",
                     "referenceId": uuid.uuid4().hex,
                     "talkMetaData": json.dumps(meta),
                     "fileName": fname,
                 }))
-            if ext not in (".mp3", ".wav") and send_path != audio_path:
-                try:
-                    os.unlink(send_path)
-                except OSError:
-                    pass
             if code == 200:
                 return SendResult(success=True)
             log.warning("[talk] attachment %s — falling back to share-as-file", code)
@@ -404,6 +436,12 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         except Exception as e:
             log.warning("[talk] send_voice error: %s — falling back to share-as-file", e)
             return await self.send_file(chat_id, audio_path, caption=caption)
+        finally:
+            if tmp_converted:
+                try:
+                    os.unlink(tmp_converted)
+                except OSError:
+                    pass
 
     def _ocs_api_raw(self, path: str, payload: Dict):
         """Sync OCS POST → (status, parsed json | raw str)."""
