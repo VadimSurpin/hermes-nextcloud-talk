@@ -27,6 +27,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.2.0] — 2026-09-27
+
+### Added
+- **LLM-facing confirmations**: embed `[[CONFIRM:scope|Question?]]` in a reply —
+  `send()` intercepts the marker, posts the question with ✅/❌/⏩ reaction buttons
+  (via `ask_confirm`), blocks until the user reacts or timeout, then posts a
+  verdict message (✅ Подтверждено / ❌ Отменено). After ⏩ the scope is remembered
+  for the session and further same-scope markers are auto-approved without buttons.
+- `platform_hint` now documents the marker for the LLM.
+- README: reaction-confirmations section updated with the marker syntax.
+
 ## [1.1.1] — 2026-09-27
 
 ### Fixed

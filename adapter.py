@@ -367,11 +367,41 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                 await asyncio.gather(*self._room_tasks.values(), return_exceptions=True)
             self._room_tasks.clear()
 
+    # Маркер для LLM-ответов: строка «[[CONFIRM:scope|Вопрос?]]» в тексте ответа
+    # превращается в реакционные кнопки ✅/❌/⏩ (ask_confirm). Результат придёт
+    # в следующее сообщение пользователя как «[[CONFIRMED:scope|approve|false]]».
+    CONFIRM_MARKER_RE = re.compile(r"\[\[CONFIRM:([^|\]]+)\|([^\]]+)\]\]")
+
     async def send(self, chat_id: str, content: str,
                    reply_to: Optional[str] = None,
                    metadata: Optional[Dict[str, Any]] = None) -> SendResult:
         """Send text. metadata supports: thread_id (reply in thread),
-        thread_title (create a new thread), silent."""
+        thread_title (create a new thread), silent.
+
+        LLM integration: a line «[[CONFIRM:scope|Question?]]» inside content is
+        replaced by the reaction-buttons flow (ask_confirm) — the question is
+        sent, buttons attached, and the answer is awaited inline (blocking send,
+        up to CONFIRM_TIMEOUT). The decision is appended to the chat as a
+        «✅ Подтверждено / ❌ Отменено» notice."""
+        m = self.CONFIRM_MARKER_RE.search(content or "")
+        if m and not (metadata or {}).get("silent"):
+            scope, question = m.group(1).strip(), m.group(2).strip()
+            head = content[:m.start()].rstrip()
+            tail = content[m.end():].lstrip()
+            if head:
+                await self._post(f"{API_V1}/chat/{chat_id}",
+                                 {"message": head[:MAX_MESSAGE_LENGTH]})
+            decision, remember = await self.ask_confirm(
+                chat_id, question, scope=scope or None)
+            verdict = ("✅ Подтверждено" if decision == "approve" else "❌ Отменено")
+            if remember:
+                verdict += " (и запомнено на сессию)"
+            notice = f"{verdict}: {question}"
+            if tail:
+                notice += "\n\n" + tail
+            await self._post(f"{API_V1}/chat/{chat_id}",
+                             {"message": notice[:MAX_MESSAGE_LENGTH]})
+            return SendResult(success=True)
         try:
             payload: Dict[str, Any] = {"message": content[:MAX_MESSAGE_LENGTH]}
             if reply_to:
@@ -732,6 +762,12 @@ def register(ctx) -> None:
         allow_update_command=True,
         platform_hint=(
             "You are communicating via Nextcloud Talk (room token = chat_id). "
-            "Keep responses concise. Voice replies are delivered as audio attachments."
+            "Keep responses concise. Voice replies are delivered as audio attachments. "
+            "CONFIRMATIONS: for risky/irreversible actions embed a marker line "
+            "[[CONFIRM:scope|Question?]] in your reply (scope = short category like "
+            "delete_file). The adapter turns it into reaction-buttons ✅/❌/⏩ and "
+            "blocks until the user reacts (or timeout). After the user taps ⏩ once, "
+            "same-scope questions are auto-approved for the session. Do NOT ask "
+            "confirmation in plain text yourself."
         ),
     )
