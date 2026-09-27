@@ -89,6 +89,17 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         r.raise_for_status()
         return r.json().get("ocs", {}).get("data", {})
 
+    async def _get_poll(self, path: str, params: Optional[Dict] = None) -> Optional[Any]:
+        """Long-poll GET: 304 (Not Modified) — нормальный пустой цикл, не ошибка.
+
+        Возвращает None при 304, иначе ocs.data. Экономит время: без
+        exception-handling на каждом 30-секундном холостом цикле."""
+        r = await self._client.get(self._url(path), params=params, headers=self._headers())
+        if r.status_code == 304:
+            return None
+        r.raise_for_status()
+        return r.json().get("ocs", {}).get("data", {})
+
     async def _post(self, path: str, payload: Dict) -> Any:
         r = await self._client.post(self._url(path), json=payload, headers=self._headers())
         r.raise_for_status()
@@ -147,7 +158,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                 last = self._last_msg_ids.get(token)
                 if last:
                     params["lastKnownMessageId"] = last
-                data = await self._get(f"{API_V1}/chat/{token}", params)
+                data = await self._get_poll(f"{API_V1}/chat/{token}", params)
                 streak = 0
                 msgs = data if isinstance(data, list) else []
                 for m in msgs:
@@ -221,9 +232,11 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             except asyncio.CancelledError:
                 raise
             except httpx.HTTPStatusError as e:
-                if e.response.status_code not in (304, 404):
-                    log.warning("poll %s: %s", token, e)
-                    streak += 1
+                if e.response.status_code in (304, 404):
+                    # 304 уже обработан в _get_poll; 404 — комната исчезла: тихо
+                    continue
+                log.warning("poll %s: %s", token, e)
+                streak += 1
             except Exception as e:
                 log.warning("poll %s: %s", token, e)
                 streak += 1
@@ -344,7 +357,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                     except Exception as e:
                         log.error("failed to list rooms: %s", e)
                         self._rooms_refresh_at = now + 15.0
-                await asyncio.sleep(2)
+                await asyncio.sleep(0.5)
         finally:
             # остановка ЛЮБЫМ путём: _running=False, cancel listen, ошибка —
             # все room-таски отменяются гарантированно (никаких зависаний)

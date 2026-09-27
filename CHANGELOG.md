@@ -27,6 +27,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.1.1] — 2026-09-27
+
+### Fixed
+- **Latency**: HTTP 304 (empty long-poll cycle) no longer raised as an exception —
+  handled in `_get_poll()` and treated as a normal empty loop. Removes spurious
+  exponential backoff (up to 300 s) that could stall message delivery.
+- Room-list refresh loop: 2 s → 0.5 s sleep — new rooms are picked up faster.
+
 ### Added
 - Nextcloud Talk platform adapter for Hermes Agent (plugin API, `register(ctx)`).
 - Message receiving: long-poll `GET /chat/{token}?lookIntoFuture=1` with own-message filtering by `actorId`.
