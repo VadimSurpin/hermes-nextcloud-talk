@@ -3,15 +3,29 @@
 All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [1.1.0] — 2026-09-23
 
 ### Added
 - Reactions: `react()`, `unreact()`, `get_reactions()` via `/reaction/{token}/{messageId}`.
 - Threads: `send(metadata={"thread_title": ...})` creates a thread; `{"thread_id": ...}` replies into one.
 - `listen()` now maps `threadId`, `reactions`, and `replyTo` into `MessageEvent` (`reply_to_message_id` + `metadata`).
 - `send()` supports `silent` flag.
+- **Reaction confirmations** `ask_confirm(chat_id, question, scope, timeout, default)`: emulates
+  Telegram-style confirm buttons with reactions ✅ / ❌ / ⏩ ("yes & stop asking" for a named scope).
+  Human reactions arrive in the long-poll as system messages `<emoji>` and are matched against
+  pending questions (`_resolve_confirm_from_system`); timeout → `default` + cancellation notice.
+- **Incoming attachment download**: voice notes and files are auto-downloaded to
+  `/opt/data/cache/talk_files/` via WebDAV and exposed as `metadata.file_path` / `file_name` /
+  `file_mimetype` on the `MessageEvent`. File messages are typed by MIME
+  (PHOTO/VIDEO/AUDIO/DOCUMENT).
 
-## [1.0.0] — 2026-09-06
+### Fixed
+- Attachment download URL encoding: Talk recording names contain spaces/parens — path is now
+  percent-encoded per segment (404 → 200).
+- Voice-note format reality: Talk records **AAC in an M4A container named `.mp3`**
+  (`Content-Type: audio/mpeg`) — documented; decode by content, never by extension.
+
+## [Unreleased]
 
 ### Added
 - Nextcloud Talk platform adapter for Hermes Agent (plugin API, `register(ctx)`).

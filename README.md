@@ -15,9 +15,36 @@ A Hermes Agent platform plugin that turns **Nextcloud Talk** into a full-feature
 | Text sending | `POST /chat/{token}` |
 | 🎙 Native voice messages | OGG → MP3 (ffmpeg) → Draft-folder → attachment endpoint with `messageType: voice-message` → compact waveform player |
 | 🖼 Images / 🎬 Videos / files | Attachment endpoint + `caption` in `talkMetaData` — caption lives on the media itself |
+| 📥 **Incoming attachments** | Voice notes & files auto-downloaded to a local dir (`metadata.file_path`) — ready for transcription/processing |
+| ✅ **Reaction confirmations** | Telegram-style confirm buttons via reactions: bot asks → user taps ✅ / ❌ / ⏩ ("yes & stop asking" per scope) |
 | 📎 Delivery fallback | Share-to-chat (`shareType=10`) when the attachment endpoint is unavailable |
 | ⏰ Cron delivery | `deliver=talk` + `TALK_HOME_CHANNEL` |
 | 🧠 Full Hermes stack | Sessions, memory, skills, pairing — everything works |
+
+### Reaction confirmations (✅ / ❌ / ⏩)
+
+Talk has no inline keyboard like Telegram, so the plugin emulates confirm
+buttons with **reactions**:
+
+```
+Bot:  ⚠️ Delete file example.zip?
+      ✅ — yes  ·  ❌ — no  ·  ⏩ — yes and stop asking  (⏱ 120 s)
+User: (taps ⏩ reaction under the message)
+Bot:  ✅ Done — won't ask about delete_file again this session.
+```
+
+```python
+decision, remember = await adapter.ask_confirm(
+    chat_id, "Delete file example.zip?",
+    scope="delete_file",       # remembered after ⏩
+    timeout=120, default="decline")
+# decision: "approve" | "decline"; remember: True if user tapped ⏩
+```
+
+How it works: a human reaction arrives in the long-poll as a **system
+message** whose text is the emoji — the adapter matches it against pending
+questions. Note: Talk records voice notes as **AAC inside an M4A container
+named `.mp3`** — never trust the extension, decode by content.
 
 ## Installation
 

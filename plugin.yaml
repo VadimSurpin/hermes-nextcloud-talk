@@ -2,7 +2,7 @@
 name: nextcloud-talk-platform
 label: Nextcloud Talk
 kind: platform
-version: 1.0.0
+version: 1.1.0
 description: >
   Nextcloud Talk gateway adapter for Hermes Agent. Polls the Talk chat API
   (OCS /chat/{token}, lookIntoFuture long-poll) and sends replies via POST.

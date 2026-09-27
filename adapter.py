@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 import urllib.request
 import uuid
@@ -31,6 +32,16 @@ API_V4 = "/ocs/v2.php/apps/spreed/api/v4"
 MAX_MESSAGE_LENGTH = 32000
 TALK_FILES_DIR = "Talk"          # Files/Talk — chat attachment storage
 
+# Confirmation-by-reaction (кнопки-подтверждения, как inline в Telegram):
+#   ✅  = подтвердить            (approve)
+#   ❌  = отклонить              (decline)
+#   ⏩  = «дальше без спроса» — запомнить выбор и применять к таким вопросам в этой сессии
+CONFIRM_EMOJI_APPROVE = "✅"
+CONFIRM_EMOJI_DECLINE = "❌"
+CONFIRM_EMOJI_SESSION = "⏩"
+CONFIRM_EMOJIS = (CONFIRM_EMOJI_APPROVE, CONFIRM_EMOJI_DECLINE, CONFIRM_EMOJI_SESSION)
+CONFIRM_TIMEOUT = 120.0        # сек на реакцию
+
 
 def _env(name: str, default: str = "") -> str:
     v = os.getenv(name)
@@ -54,6 +65,10 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         self._listen_task: Optional[asyncio.Task] = None
         self._rooms_refresh_at = 0.0               # когда пересобрать список комнат
         self._room_tasks: Dict[str, asyncio.Task] = {}  # token -> task (параллельный поллинг)
+        # ---- confirmation-by-reaction ----
+        self._pending_confirms: Dict[str, Dict] = {}   # key "room:msgid" -> {fut, room, msgid, actor}
+        self._session_scope: Dict[str, set] = {}       # scope-name -> set('approve'|'decline') («✔️ в сессию»)
+        self._confirm_watcher: Optional[asyncio.Task] = None
 
     # ---------- HTTP helpers ----------
 
@@ -106,6 +121,11 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         self._running = False
+        # резолвим все висящие confirm-фьючерсы отменой
+        for pend in self._pending_confirms.values():
+            if not pend["fut"].done():
+                pend["fut"].cancel()
+        self._pending_confirms.clear()
         if self._listen_task:
             self._listen_task.cancel()
             try:
@@ -133,6 +153,12 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                 for m in msgs:
                     mid = m.get("id", 0)
                     self._last_msg_ids[token] = max(self._last_msg_ids.get(token, 0), mid)
+                    # ---- system-сообщение «reaction»: <emoji> — это клик по кнопке ----
+                    if (m.get("messageType") == "system" and m.get("actorId") != self.user
+                            and (m.get("message") or "") in CONFIRM_EMOJIS
+                            and self._pending_confirms):
+                        await self._resolve_confirm_from_system(token, m)
+                        continue
                     if m.get("actorId") == self.user:
                         continue
                     processed = self._processed_ids.setdefault(token, set())
@@ -142,7 +168,32 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                     if len(processed) > 500:
                         self._processed_ids[token] = set(sorted(processed)[-200:])
                     mtype = MessageType.VOICE if m.get("messageType") == "voice-message" else MessageType.TEXT
+                    if m.get("messageType") == "file":
+                        # не аудио и не картинка → DOCUMENT, иначе точный тип
+                        mime = ((m.get("messageParameters") or {}).get("file") or {}).get("mimetype", "")
+                        if mime.startswith("image/"):
+                            mtype = MessageType.PHOTO
+                        elif mime.startswith("video/"):
+                            mtype = MessageType.VIDEO
+                        elif mime.startswith("audio/"):
+                            mtype = MessageType.AUDIO
+                        else:
+                            mtype = MessageType.DOCUMENT
                     actor = m.get("actorId") or "unknown"
+                    # ---- реакции как кнопки подтверждения ----
+                    reactions = m.get("reactions") or {}
+                    if reactions and self._pending_confirms:
+                        await self._check_confirm_reaction(token, mid, reactions)
+                    # ---- вложение (голосовое/файл): скачать локально ----
+                    file_info = (m.get("messageParameters") or {}).get("file") or {}
+                    local_path = None
+                    if file_info.get("path"):
+                        local_path = await asyncio.to_thread(
+                            self._download_attachment_sync, file_info["path"],
+                            f"{token}_{mid}_{file_info.get('name', 'file')}")
+                        if local_path is None:
+                            log.warning("[talk] attachment download failed: %s",
+                                        file_info.get("name"))
                     source = self.build_source(
                         chat_id=token, chat_name=token, chat_type="dm",
                         user_id=actor, user_name=m.get("actorDisplayName") or actor,
@@ -162,6 +213,9 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                         "thread_id": m.get("threadId"),
                         "reactions": m.get("reactions") or {},
                         "expiration": m.get("expirationTimestamp"),
+                        "file_path": local_path,
+                        "file_name": file_info.get("name"),
+                        "file_mimetype": file_info.get("mimetype"),
                     }
                     await self.handle_message(ev)
             except asyncio.CancelledError:
@@ -179,6 +233,84 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                 delay = min(self.poll_interval * (2 ** min(streak, 6)), 300.0)
                 await asyncio.sleep(delay)
             # иначе — немедленно следующий long-poll
+
+    async def _resolve_confirm_from_system(self, room: str, m: Dict) -> None:
+        """System-сообщение вида '<emoji>' (reaction от человека) → резолвим
+        самый свежий pending-вопрос этой комнаты."""
+        emoji = m.get("message")
+        actor = m.get("actorId")
+        # ищем pending-вопрос этой комнаты (при нескольких — ближайший по времени)
+        cands = [(k, p) for k, p in self._pending_confirms.items()
+                 if p["room"] == room]
+        if not cands:
+            return
+        # реакция на конкретное сообщение ссылается на parent через...
+        # system-reaction НЕ несёт id цели — считаем, что отвечают на последний вопрос
+        key, pend = max(cands, key=lambda kv: kv[1]["msgid"])
+        self._pending_confirms.pop(key, None)
+        if pend["fut"].done():
+            return
+        if emoji == CONFIRM_EMOJI_APPROVE:
+            pend["fut"].set_result(("approve", False))
+        elif emoji == CONFIRM_EMOJI_DECLINE:
+            pend["fut"].set_result(("decline", False))
+        else:  # ⏩ — да + запомнить выбор по scope
+            pend["fut"].set_result(("approve", True))
+
+    # ---------- Confirmation by reaction (кнопки ✅ / ❌ / ⏩) ----------
+
+    def _check_session_scope(self, scope: Optional[str]) -> Optional[str]:
+        """Если по этому scope уже есть выбор «⏩ без спроса» — вернуть его."""
+        if scope:
+            saved = self._session_scope.get(scope)
+            if saved:
+                return next(iter(saved))
+        return None
+
+    async def ask_confirm(self, chat_id: str, question: str, *,
+                          scope: Optional[str] = None,
+                          timeout: float = CONFIRM_TIMEOUT,
+                          default: str = "decline") -> tuple:
+        """Кнопки-подтверждение через реакции.
+
+        Отправляет вопрос и ставит три реакции-«кнопки»: ✅ / ❌ / ⏩.
+        Возвращает (decision, remember):
+          decision ∈ 'approve' | 'decline', remember=True если жали ⏩.
+        scope — именованная категория («delete_file», «send_email», ...):
+          повторный вопрос того же scope при remember=True не задаётся.
+        """
+        remembered = self._check_session_scope(scope)
+        if remembered:
+            return (remembered, False)
+
+        q = question if len(question) <= 3000 else question[:2997] + "…"
+        text = (f"{q}\n\n✅ — да   ·   ❌ — нет   ·   ⏩ — да и дальше без спроса"
+                f"   (⏱ {int(timeout)} с)")
+        r = await self._post(f"{API_V1}/chat/{chat_id}", {"message": text})
+        msg_id = r.get("id")
+        for emoji in CONFIRM_EMOJIS:
+            try:
+                await self._post(f"{API_V1}/reaction/{chat_id}/{msg_id}",
+                                 {"reaction": emoji})
+            except Exception as e:
+                log.warning("confirm react %s: %s", emoji, e)
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._pending_confirms[f"{chat_id}:{msg_id}"] = {
+            "fut": fut, "room": chat_id, "msgid": msg_id,
+            "default": default,
+        }
+        try:
+            decision, remember = await asyncio.wait_for(fut, timeout=timeout)
+        except asyncio.TimeoutError:
+            self._pending_confirms.pop(f"{chat_id}:{msg_id}", None)
+            decision, remember = (default, False)
+            try:
+                await self.send(chat_id, f"⏱ Не дождался реакции — отмена.")
+            except Exception:
+                pass
+        if remember and scope:
+            self._session_scope[scope] = {decision}
+        return (decision, remember)
 
     def _spawn_room_tasks(self, tokens: list) -> None:
         """Создаёт task на каждую новую комнату (существующие не трогаем)."""
@@ -273,6 +405,38 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         return data if isinstance(data, dict) else {}
 
     # ---------- Media: files upload + share-to-chat ----------
+
+    TALK_INCOMING_DIR = "/opt/data/cache/talk_files"   # куда складывать входящие вложения
+
+    def _download_attachment_sync(self, remote_path: str, suggested_name: str) -> Optional[str]:
+        """Скачать входящее вложение из Talk (WebDAV) локально.
+
+        ВАЖНО (проверено на реальных записях Talk 23.09 и 27.09.2026): Talk
+        пишет голосовые как **AAC в M4A-контейнере**, но сохраняет под именем
+        *.mp3 и отдаёт Content-Type audio/mpeg. Расширению доверять нельзя —
+        скачиваем как есть; декодеры (ffmpeg/faster-whisper) определяют формат
+        по контенту сами.
+        Возвращает локальный путь или None при ошибке.
+        """
+        import base64
+        import urllib.parse
+        try:
+            os.makedirs(self.TALK_INCOMING_DIR, exist_ok=True)
+            cred = base64.b64encode(f"{self.user}:{self.password}".encode()).decode()
+            url = (f"{self.server}/remote.php/dav/files/{self.user}/"
+                   f"{urllib.parse.quote(remote_path.lstrip('/'))}")
+            req = urllib.request.Request(url, headers={"Authorization": f"Basic {cred}"})
+            data = urllib.request.urlopen(req, timeout=120).read()
+            # имя: token_msgid_name, но расширение берём из remote (не выдумываем)
+            safe = re.sub(r"[^\w.\-]+", "_", suggested_name)[-120:]
+            local = os.path.join(self.TALK_INCOMING_DIR, safe)
+            with open(local, "wb") as fh:
+                fh.write(data)
+            log.info("[talk] attachment saved: %s (%d bytes)", local, len(data))
+            return local
+        except Exception as e:
+            log.warning("[talk] download_attachment %s: %s", remote_path, e)
+            return None
 
     def _webdav_put_sync(self, remote_path: str, data: bytes, ctype: str) -> int:
         """WebDAV PUT (sync; call from to_thread). Returns HTTP status."""
