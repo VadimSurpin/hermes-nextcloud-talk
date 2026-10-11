@@ -1,18 +1,18 @@
 """HPB (standalone signaling) client for the Nextcloud Talk adapter.
 
-Даёт: мгновенные события (вместо 30-с long-poll) и typing-индикатор.
+Provides: instant events (instead of 30s long-poll) and the typing indicator.
 
-Флоу (проверено live 28.09.2026):
-  1. OCS POST /room/{token}/participants/active  -> NC sessionId (255 байт)
+Flow (verified live 2026-09-28):
+  1. OCS POST /room/{token}/participants/active  -> NC sessionId (255 bytes)
   2. WSS {hpb_url} → welcome → hello v1 (auth.url + {userid, ticket})
   3. WS  {"type":"room","room":{"roomid":token,"sessionid":NC_SESSION_ID}}
-     ← room joined. ВАЖНО: без sessionid в room-запросе NC отвечает
-     «no_such_room / not invited» (backendRoom ищет participant по session).
+     <- room joined. IMPORTANT: without sessionid in the room request NC replies
+     'no_such_room / not invited' (backendRoom looks up the participant by session).
   4. typing: {"type":"message","message":{"roomid":token,
      "data":"{\"type\":\"typing\",\"stream\":{\"signal\":\"typing\"}"}"}}
-  5. Входящие события чата: {"type":"event","event":{"target":"room",...}}
+  5. Inbound chat events: {"type":"event","event":{"target":"room",...}}
 
-При любом сбое HPB адаптер продолжает работать через long-poll.
+On any HPB failure the adapter keeps working via long-poll.
 """
 
 import asyncio
@@ -31,14 +31,14 @@ API_V1 = "/ocs/v2.php/apps/spreed/api/v1"
 API_V3 = "/ocs/v2.php/apps/spreed/api/v3"
 API_V4 = "/ocs/v2.php/apps/spreed/api/v4"
 
-# Typing-пинг надо повторять, пока «печатаем» (индикатор гаснет через ~5 c)
+# Typing ping must repeat while 'typing' (indicator expires after ~5s)
 TYPING_INTERVAL = 4.0
 RECONNECT_MIN = 2.0
 RECONNECT_MAX = 60.0
 
 
 class HPBClient:
-    """WS-клиент standalone-signaling для одной комнаты Talk."""
+    """Standalone-signaling WS client for a single Talk room."""
 
     def __init__(self, server: str, user: str, password: str,
                  room_token: str, hpb_url: str,
@@ -48,7 +48,7 @@ class HPBClient:
         self.password = password
         self.room = room_token
         self.hpb_url = hpb_url
-        self.on_event = on_event          # async callable(dict) — события HPB
+        self.on_event = on_event          # async callable(dict) — HPB events
         self._headers = {
             "OCS-APIRequest": "true",
             "Accept": "application/json",
@@ -62,6 +62,7 @@ class HPBClient:
         self._typing_until = 0.0
         self._connected = False
         self._public_sid = None
+        self._participants: set = set()  # signaling sessionids of room participants
 
     # ---------- OCS helpers ----------
 
@@ -81,12 +82,12 @@ class HPBClient:
         return r.json().get("ocs", {}).get("data", {})
 
     async def _ocs_join_room(self, client: httpx.AsyncClient) -> str:
-        """participants/active → создаёт NC-session, возвращает sessionid."""
+        """participants/active -> creates the NC session, returns sessionid."""
         data = await self._ocs_post(
             client, f"{API_V4}/room/{self.room}/participants/active", {})
         sid = data.get("sessionId")
         if not sid:
-            raise RuntimeError("participants/active вернул пустой sessionId")
+            raise RuntimeError("participants/active returned an empty sessionId")
         return sid
 
     # ---------- main loop ----------
@@ -120,11 +121,11 @@ class HPBClient:
         st = await self._fetch_settings(http)
         hello_params = (st.get("helloAuthParams") or {}).get("1.0")
         if not hello_params:
-            raise RuntimeError("нет helloAuthParams 1.0 в signaling settings")
+            raise RuntimeError("no helloAuthParams 1.0 in signaling settings")
         wss = st["server"].replace("https://", "wss://").replace(
             "http://", "ws://").rstrip("/") + "/spreed"
 
-        # 2) NC session (обязателен для room-join!)
+        # 2) NC session (required for room-join!)
         nc_session = await self._ocs_join_room(http)
 
         ssl_ctx = ssl.create_default_context()
@@ -149,16 +150,16 @@ class HPBClient:
 
             self._connected = True
             log.info("[hpb] joined room %s (instant events ON)", self.room)
-
-            # handler для исходящего typing живёт в отдельной задаче
+            # outgoing typing handler lives in a separate task
             self._typing_task = asyncio.create_task(self._typing_loop(ws))
 
-            # 3) читаем события
+            # 3) read events
             async for raw in ws:
                 try:
                     ev = json.loads(raw)
                 except json.JSONDecodeError:
                     continue
+                self._track_participants(ev)
                 if ev.get("type") == "event" and self.on_event:
                     try:
                         await self.on_event(ev.get("event", {}))
@@ -167,18 +168,62 @@ class HPBClient:
 
     # ---------- typing ----------
 
+    def _track_participants(self, ev: dict) -> None:
+        """Track signaling sessionids of room participants (join/leave + room reply)."""
+        try:
+            if ev.get("type") == "room":
+                parts = (ev.get("room", {}) or {}).get("participants") or []
+                self._participants = {p.get("sessionId") or p.get("sessionid")
+                                      for p in parts if p.get("sessionId") or p.get("sessionid")}
+                return
+            if ev.get("type") != "event":
+                return
+            e = ev.get("event", {}) or {}
+            if e.get("type") == "join":
+                for u in e.get("join") or []:
+                    sid = u.get("sessionid")
+                    if sid:
+                        self._participants.add(sid)
+            elif e.get("type") == "leave":
+                for sid in e.get("leave") or []:
+                    self._participants.discard(sid)
+        except Exception as e:
+            log.debug("[hpb] track participants: %s", e)
+
     def set_typing(self, active: bool) -> None:
-        """Включить/выключить индикатор «печатает» (управляется адаптером)."""
+        """Enable/disable the typing indicator (driven by the adapter)."""
         self._typing_until = float("inf") if active else 0.0
 
     async def _typing_loop(self, ws) -> None:
+        """Peer-to-peer typing per the Talk client protocol (SignalingTypingHandler):
+        send to every room participant except ourselves, personally —
+        {type: startedTyping|stoppedTyping}; the server fills in "from".
+        The legacy {"type":"typing","stream":...} format is ignored by
+        current Talk clients."""
+        announced = False  # typing already announced to the current roster
         while True:
-            if time.time() < self._typing_until and self._public_sid:
-                await ws.send(json.dumps({
-                    "type": "message",
-                    "message": {
-                        "recipient": {"type": "room",
-                                      "sessionid": self._public_sid},
-                        "data": {"type": "typing",
-                                 "stream": {"signal": "typing"}}}}))
+            typing_active = time.time() < self._typing_until
+            if typing_active and self._participants:
+                for sid in self._participants:
+                    if sid == self._public_sid:
+                        continue
+                    await ws.send(json.dumps({
+                        "type": "message",
+                        "message": {
+                            "recipient": {"type": "session", "sessionid": sid},
+                            "data": {"type": "startedTyping"}}}))
+                announced = True
+            elif announced:
+                for sid in self._participants:
+                    if sid == self._public_sid:
+                        continue
+                    try:
+                        await ws.send(json.dumps({
+                            "type": "message",
+                            "message": {
+                                "recipient": {"type": "session", "sessionid": sid},
+                                "data": {"type": "stoppedTyping"}}}))
+                    except Exception:
+                        pass
+                announced = False
             await asyncio.sleep(TYPING_INTERVAL)

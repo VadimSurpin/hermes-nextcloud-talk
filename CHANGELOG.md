@@ -27,6 +27,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+- **Typing indicator restored for current Talk clients.** The legacy room
+  broadcast `{"type":"typing","stream":{"signal":"typing"}}` is silently ignored
+  by current Nextcloud Talk frontends: `SignalingTypingHandler` only reacts to
+  peer-to-peer `{type: "startedTyping" | "stoppedTyping"}` messages delivered
+  via the signaling `message` channel. The HPB client now tracks room
+  participants (`join`/`leave` events + the `room` reply) and sends
+  `startedTyping`/`stoppedTyping` **personally to each participant**
+  (`recipient: {type: "session", sessionid: <sid>}`, excluding self), with a
+  single `stoppedTyping` once the answer is out.
+- Typing on the HPB event path: `start_typing()` was only called on the
+  legacy long-poll path, so messages received via instant HPB events never
+  triggered the indicator. Now invoked on both paths.
+
 ## [1.3.0] — 2026-09-28
 
 ### Added

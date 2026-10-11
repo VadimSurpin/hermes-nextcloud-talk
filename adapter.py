@@ -488,6 +488,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                 ev.metadata = {"room": token, "file_path": local_path,
                                "file_name": file_info.get("name"),
                                "via": "hpb"}
+                self.start_typing(token)  # «печатает…» пока LLM готовит ответ
                 await self.handle_message(ev)
         except Exception as e:
             log.warning("[hpb] event handling: %s", e)
