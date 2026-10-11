@@ -61,6 +61,7 @@ class HPBClient:
         self._typing_task: asyncio.Task | None = None
         self._typing_until = 0.0
         self._connected = False
+        self._public_sid = None
 
     # ---------- OCS helpers ----------
 
@@ -137,6 +138,7 @@ class HPBClient:
             hello = json.loads(await ws.recv())
             if hello.get("type") != "hello":
                 raise RuntimeError(f"hello failed: {json.dumps(hello)[:200]}")
+            self._public_sid = hello["hello"]["sessionid"]
 
             await ws.send(json.dumps({
                 "type": "room",
@@ -171,10 +173,12 @@ class HPBClient:
 
     async def _typing_loop(self, ws) -> None:
         while True:
-            if time.time() < self._typing_until:
+            if time.time() < self._typing_until and self._public_sid:
                 await ws.send(json.dumps({
                     "type": "message",
-                    "message": {"roomid": self.room,
-                                "data": json.dumps({"type": "typing",
-                                                    "stream": {"signal": "typing"}})}}))
+                    "message": {
+                        "recipient": {"type": "room",
+                                      "sessionid": self._public_sid},
+                        "data": {"type": "typing",
+                                 "stream": {"signal": "typing"}}}}))
             await asyncio.sleep(TYPING_INTERVAL)
