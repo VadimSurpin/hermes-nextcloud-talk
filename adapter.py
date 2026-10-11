@@ -255,6 +255,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                         "file_name": file_info.get("name"),
                         "file_mimetype": file_info.get("mimetype"),
                     }
+                    self.start_typing(token)  # «печатает…» пока LLM готовит ответ
                     await self.handle_message(ev)
             except asyncio.CancelledError:
                 raise
