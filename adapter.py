@@ -18,6 +18,13 @@ except ImportError:
     httpx = None  # type: ignore[assignment]
 
 from gateway.config import PlatformConfig
+
+try:
+    from .hpb import HPBClient
+    HPB_AVAILABLE = True
+except ImportError:
+    HPB_AVAILABLE = False
+    HPBClient = None
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -65,6 +72,12 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         self._listen_task: Optional[asyncio.Task] = None
         self._rooms_refresh_at = 0.0               # когда пересобрать список комнат
         self._room_tasks: Dict[str, asyncio.Task] = {}  # token -> task (параллельный поллинг)
+        # ---- HPB (standalone signaling): мгновенные события + typing ----
+        _hpb_raw = extra.get("hpb_url") or _env("TALK_HPB_URL") or ""
+        # нормализация: принимаем и origin (https://host), и полный wss://host/standalone-signaling/spreed
+        _hpb_origin = re.sub(r"^(wss|https)://([^/]+).*$", r"https://\2", _hpb_raw)
+        self.hpb_url = _hpb_origin if _hpb_origin.startswith("https://") else None
+        self._hpb_clients: Dict[str, "HPBClient"] = {}
         # ---- confirmation-by-reaction ----
         self._pending_confirms: Dict[str, Dict] = {}   # key "room:msgid" -> {fut, room, msgid, actor}
         self._session_scope: Dict[str, set] = {}       # scope-name -> set('approve'|'decline') («✔️ в сессию»)
@@ -128,10 +141,24 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                 log.warning("failed to get last id: %s", e)
         self._running = True
         self._listen_task = asyncio.create_task(self.listen())
+        # HPB: мгновенные события + typing (опционально, при наличии hpb_url)
+        if self.hpb_url and HPB_AVAILABLE and self.default_room:
+            try:
+                hpb = HPBClient(self.server, self.user, self.password,
+                                self.default_room, self.hpb_url,
+                                on_event=self._on_hpb_event)
+                hpb.start()
+                self._hpb_clients[self.default_room] = hpb
+                log.info("[hpb] client started for %s", self.default_room)
+            except Exception as e:
+                log.warning("[hpb] not started (%s) — long-poll fallback", e)
         return True
 
     async def disconnect(self) -> None:
         self._running = False
+        for hpb in self._hpb_clients.values():
+            hpb.stop()
+        self._hpb_clients.clear()
         # резолвим все висящие confirm-фьючерсы отменой
         for pend in self._pending_confirms.values():
             if not pend["fut"].done():
@@ -375,6 +402,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
     async def send(self, chat_id: str, content: str,
                    reply_to: Optional[str] = None,
                    metadata: Optional[Dict[str, Any]] = None) -> SendResult:
+        self.stop_typing(str(chat_id))
         """Send text. metadata supports: thread_id (reply in thread),
         thread_title (create a new thread), silent.
 
@@ -417,6 +445,62 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             return SendResult(success=True)
         except Exception as e:
             return SendResult(success=False, error=str(e))
+
+    # ---------- HPB events & typing ----------
+
+    async def _on_hpb_event(self, event: Dict) -> None:
+        """Событие из HPB (signaling). Тchat-сообщения приходят как
+        event.data.chat = [{...message...}] (feature chat-relay) либо как
+        typing-сигналы. Сообщения дедуплицируются по id (как в поллинге)."""
+        try:
+            data = event.get("data") or {}
+            # typing от других — можно пробросить в gateway как metadata (не критично)
+            if data.get("type") == "typing":
+                return
+            chat_msgs = data.get("chat") or []
+            token = event.get("roomid") or self.default_room
+            for m in chat_msgs:
+                mid = m.get("id") or 0
+                if m.get("actorId") == self.user:
+                    continue
+                processed = self._processed_ids.setdefault(token, set())
+                if mid in processed:
+                    continue
+                processed.add(mid)
+                actor = m.get("actorId") or "unknown"
+                mtype = (MessageType.VOICE
+                         if m.get("messageType") == "voice-message" else MessageType.TEXT)
+                file_info = (m.get("messageParameters") or {}).get("file") or {}
+                local_path = None
+                if file_info.get("path"):
+                    local_path = await asyncio.to_thread(
+                        self._download_attachment_sync, file_info["path"],
+                        f"{token}_{mid}_{file_info.get('name', 'file')}")
+                source = self.build_source(
+                    chat_id=token, chat_name=token, chat_type="dm",
+                    user_id=actor, user_name=m.get("actorDisplayName") or actor)
+                ev = MessageEvent(
+                    text=m.get("text") or m.get("message") or "",
+                    message_type=mtype, source=source, user_id=actor,
+                    user_name=m.get("actorDisplayName") or actor,
+                    message_id=str(mid), raw_message=m, reply_to_message_id=None)
+                ev.metadata = {"room": token, "file_path": local_path,
+                               "file_name": file_info.get("name"),
+                               "via": "hpb"}
+                await self.handle_message(ev)
+        except Exception as e:
+            log.warning("[hpb] event handling: %s", e)
+
+    def start_typing(self, chat_id: str) -> None:
+        """Включить «печатает…» в комнате (если HPB-клиент жив)."""
+        hpb = self._hpb_clients.get(chat_id)
+        if hpb:
+            hpb.set_typing(True)
+
+    def stop_typing(self, chat_id: str) -> None:
+        hpb = self._hpb_clients.get(chat_id)
+        if hpb:
+            hpb.set_typing(False)
 
     # ---------- Reactions ----------
 

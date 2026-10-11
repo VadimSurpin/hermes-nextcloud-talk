@@ -27,6 +27,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.3.0] — 2026-09-28
+
+### Added
+- **HPB (standalone signaling) support** (`hpb.py`): optional WS client giving
+  instant room events and the native «typing…» indicator.
+  - Key discovery: the WS room-join **must carry the Nextcloud sessionId** obtained
+    from `POST /room/{token}/participants/active` — without it NC's backend
+    room-check rejects the bot with `no_such_room / not invited` (participant is
+    looked up by session first, and the userId fallback is never reached).
+  - Typing: `{"type":"message","message":{"roomid":…,"data":"{\"type\":\"typing\",
+    \"stream\":{\"signal\":\"typing\"}}"}}` — `data` must be a **JSON string**,
+    refreshed every ~4 s; typing is switched on when a message arrives and off in `send()`.
+  - Any HPB failure logs a warning and the adapter silently falls back to long-poll.
+- Requires `websockets` + `httpx` in the gateway venv (both already present).
+
 ## [1.2.0] — 2026-09-27
 
 ### Added
