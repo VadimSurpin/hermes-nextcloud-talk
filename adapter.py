@@ -220,8 +220,10 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                     actor = m.get("actorId") or "unknown"
                     # ---- реакции как кнопки подтверждения ----
                     reactions = m.get("reactions") or {}
+                    # reactions: {emoji: count} — the count includes OUR own
+                    # button-vote (1 each). A human click shows as count 2.
                     if reactions and self._pending_confirms:
-                        await self._check_confirm_reaction(token, mid, reactions)
+                        await self._resolve_confirm_from_reactions(token, mid, reactions)
                     # ---- вложение (голосовое/файл): скачать локально ----
                     file_info = (m.get("messageParameters") or {}).get("file") or {}
                     local_path = None
@@ -291,6 +293,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         self._pending_confirms.pop(key, None)
         if pend["fut"].done():
             return
+        self.start_typing(room)  # typing on the instant the button is pressed
         if emoji == CONFIRM_EMOJI_APPROVE:
             pend["fut"].set_result(("approve", False))
         elif emoji == CONFIRM_EMOJI_DECLINE:
@@ -308,17 +311,39 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                 return next(iter(saved))
         return None
 
+    async def _resolve_confirm_from_reactions(self, room: str, mid: int,
+                                              reactions: Dict) -> None:
+        """Reaction-summary на сообщении-вопросе (chat-сообщение несёт
+        `reactions: {emoji: count}`) → резолвим pending-вопрос по msgid."""
+        key = f"{room}:{mid}"
+        pend = self._pending_confirms.get(key)
+        if not pend or pend["fut"].done():
+            return
+        for emoji, decision in ((CONFIRM_EMOJI_APPROVE, "approve"),
+                                (CONFIRM_EMOJI_DECLINE, "decline"),
+                                (CONFIRM_EMOJI_SESSION, "approve")):
+            # count>1 значит нажал не только адаптер (своя кнопка = 1)
+            if reactions.get(emoji, 0) > 1:
+                self._pending_confirms.pop(key, None)
+                self.start_typing(room)  # typing on the instant of the click
+                pend["fut"].set_result((decision, emoji == CONFIRM_EMOJI_SESSION))
+                return
+
     async def ask_confirm(self, chat_id: str, question: str, *,
                           scope: Optional[str] = None,
                           timeout: float = CONFIRM_TIMEOUT,
                           default: str = "decline") -> tuple:
-        """Кнопки-подтверждение через реакции.
+        """Confirmation buttons via reactions.
 
-        Отправляет вопрос и ставит три реакции-«кнопки»: ✅ / ❌ / ⏩.
-        Возвращает (decision, remember):
-          decision ∈ 'approve' | 'decline', remember=True если жали ⏩.
-        scope — именованная категория («delete_file», «send_email», ...):
-          повторный вопрос того же scope при remember=True не задаётся.
+        Posts the question and attaches three reaction-buttons: OK / NO /
+        FAST-FORWARD. Returns (decision, remember):
+          decision is 'approve' | 'decline'; remember=True for fast-forward.
+        scope — a named category ("delete_file", "send_email", ...): once a
+        fast-forward is remembered for a scope, later questions with the same
+        scope are auto-answered.
+        Clicks resolve via two paths: (a) HPB chat events (instant), (b) a
+        2 s reaction-summary poller (the default long-poll can stay silent
+        for up to 30 s).
         """
         remembered = self._check_session_scope(scope)
         if remembered:
@@ -340,6 +365,37 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             "fut": fut, "room": chat_id, "msgid": msg_id,
             "default": default,
         }
+
+        async def _reaction_poll() -> None:
+            """Fast reaction-summary poll (every 2 s) — otherwise the resolve
+            waits on long-poll, which can stay silent for up to 30 s."""
+            url = f"{API_V1}/reaction/{chat_id}/{msg_id}"
+            deadline = asyncio.get_running_loop().time() + timeout
+            while not fut.done() and asyncio.get_running_loop().time() < deadline:
+                await asyncio.sleep(2.0)
+                if fut.done():
+                    return
+                try:
+                    res = await self._get(url)
+                    # _get() already unwraps ocs.data -> {emoji: [{actorId,...}]}
+                    data = res if isinstance(res, dict) else {}
+                    # any non-empty emoji list means someone (not just us) reacted
+                    for emoji, decision in (
+                            (CONFIRM_EMOJI_APPROVE, "approve"),
+                            (CONFIRM_EMOJI_DECLINE, "decline"),
+                            (CONFIRM_EMOJI_SESSION, "approve")):
+                        actors = data.get(emoji)
+                        if actors:  # непустой список = кто-то (кроме нас) нажал
+                            self._pending_confirms.pop(f"{chat_id}:{msg_id}", None)
+                            self.start_typing(chat_id)  # typing on the click
+                            if not fut.done():
+                                fut.set_result((decision,
+                                                emoji == CONFIRM_EMOJI_SESSION))
+                            return
+                except Exception as e:
+                    log.debug("confirm reaction poll: %s", e)
+
+        poller = asyncio.create_task(_reaction_poll())
         try:
             decision, remember = await asyncio.wait_for(fut, timeout=timeout)
         except asyncio.TimeoutError:
@@ -349,6 +405,8 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                 await self.send(chat_id, f"⏱ Не дождался реакции — отмена.")
             except Exception:
                 pass
+        finally:
+            poller.cancel()
         if remember and scope:
             self._session_scope[scope] = {decision}
         return (decision, remember)
@@ -399,6 +457,20 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
     # превращается в реакционные кнопки ✅/❌/⏩ (ask_confirm). Результат придёт
     # в следующее сообщение пользователя как «[[CONFIRMED:scope|approve|false]]».
     CONFIRM_MARKER_RE = re.compile(r"\[\[CONFIRM:([^|\]]+)\|([^\]]+)\]\]")
+
+    # Talk treats "{word}" as a rich-object placeholder (e.g. {actor}) and
+    # rejects unknown ones with HTTP 400. Isolate literal braces with invisible
+    # characters (U+2066/U+2069) so Talk's placeholder parser doesn't match;
+    # the text renders unchanged for the user.
+    _PLACEHOLDER_RE = re.compile(r"\{([a-zA-Z][a-zA-Z0-9_-]*)\}")
+
+    @classmethod
+    def _escape_placeholders(cls, text: str) -> str:
+        # U+2066 (LRI) before "{", U+2069 (PDI) after "}" — breaks up the
+        # {word} sequence so Talk's placeholder parser doesn't match it,
+        # without altering the visible text.
+        return cls._PLACEHOLDER_RE.sub(
+            lambda m: "\u2066{" + m.group(1) + "}\u2069", text)
 
     async def send(self, chat_id: str, content: str,
                    reply_to: Optional[str] = None,
@@ -462,6 +534,16 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             token = event.get("roomid") or self.default_room
             for m in chat_msgs:
                 mid = m.get("id") or 0
+                # ---- реакции как кнопки подтверждения (HPB-путь) ----
+                reactions = m.get("reactions") or {}
+                if (m.get("messageType") == "system"
+                        and m.get("actorId") != self.user
+                        and (m.get("message") or "") in CONFIRM_EMOJIS
+                        and self._pending_confirms):
+                    await self._resolve_confirm_from_system(token, m)
+                    continue
+                if reactions and self._pending_confirms:
+                    await self._resolve_confirm_from_reactions(token, mid, reactions)
                 if m.get("actorId") == self.user:
                     continue
                 processed = self._processed_ids.setdefault(token, set())

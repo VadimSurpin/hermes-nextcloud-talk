@@ -25,19 +25,38 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Voice-note format reality: Talk records **AAC in an M4A container named `.mp3`**
   (`Content-Type: audio/mpeg`) — documented; decode by content, never by extension.
 
-## [Unreleased]
+## [1.5.0] — 2026-10-13
 
 ### Fixed
-- **Typing indicator restored for current Talk clients.** The legacy room
-  broadcast `{"type":"typing","stream":{"signal":"typing"}}` is silently ignored
-  by current Nextcloud Talk frontends: `SignalingTypingHandler` only reacts to
-  peer-to-peer `{type: "startedTyping" | "stoppedTyping"}` messages delivered
-  via the signaling `message` channel. The HPB client now tracks room
-  participants (`join`/`leave` events + the `room` reply) and sends
-  `startedTyping`/`stoppedTyping` **personally to each participant**
-  (`recipient: {type: "session", sessionid: <sid>}`, excluding self), with a
-  single `stoppedTyping` once the answer is out.
-- Typing on the HPB event path: `start_typing()` was only called on the
+- **Typing indicator: room broadcast instead of per-session sends.** Current
+  Talk clients (`SignalingTypingHandler`) only react to peer-to-peer
+  `{type: "startedTyping" | "stoppedTyping"}` messages; the legacy
+  `{"type":"typing","stream":...}` broadcast is silently ignored. Sending
+  `recipient: {type: "room"}` (server relays to everyone except the sender)
+  and repeating every ~4 s — per-session participant tracking is gone, app
+  reconnects (phone sleep, network switch) can no longer orphan the indicator.
+- **Typing task survives WS reconnects.** The typing loop held a reference to
+  one WS object; when the signaling socket dropped (server keepalive, network
+  blip), the reconnect created a new socket but the old loop kept sending into
+  the dead one — the indicator silently died until the next adapter restart.
+  The previous task is now cancelled on reconnect, and the loop exits on send
+  failure instead of retrying a dead socket.
+- **Confirm buttons: instant resolve via reaction poller.** Clicks used to be
+  picked up by the 30 s long-poll, which read as «кнопки не работают». While a
+  question is pending, a 2 s poller queries
+  `GET /reaction/{token}/{messageId}` directly (format trap: it returns a
+  dict `{emoji: [{actorId,...}]}`, and helper wrappers already unwrap
+  `ocs.data` — double-unwrapping yielded `{}` every poll and the fast path
+  silently never fired). Verified live: click → verdict in 2–3 s.
+- **Typing turns on the instant a button is pressed** — in every
+  confirm-resolve path (system message, reactions summary, poller), before
+  the verdict lands.
+- **Outgoing text with `{word}` sequences no longer fails with HTTP 400.**
+  Talk parses `{actor}`-style sequences as rich-object placeholders and
+  rejects unknown ones (plus the plain-text fallback also failed). Literal
+  braces are now isolated with invisible characters (U+2066/U+2069) — renders
+  unchanged for the user.
+- **Typing on the HPB event path**: `start_typing()` was only called on the
   legacy long-poll path, so messages received via instant HPB events never
   triggered the indicator. Now invoked on both paths.
 

@@ -150,7 +150,10 @@ class HPBClient:
 
             self._connected = True
             log.info("[hpb] joined room %s (instant events ON)", self.room)
-            # outgoing typing handler lives in a separate task
+            # outgoing typing handler lives in a separate task;
+            # on reconnect cancel the previous one (it holds a dead ws)
+            if self._typing_task and not self._typing_task.done():
+                self._typing_task.cancel()
             self._typing_task = asyncio.create_task(self._typing_loop(ws))
 
             # 3) read events
@@ -195,35 +198,36 @@ class HPBClient:
         self._typing_until = float("inf") if active else 0.0
 
     async def _typing_loop(self, ws) -> None:
-        """Peer-to-peer typing per the Talk client protocol (SignalingTypingHandler):
-        send to every room participant except ourselves, personally —
-        {type: startedTyping|stoppedTyping}; the server fills in "from".
+        """Typing per the current Talk client protocol (SignalingTypingHandler):
+        peer-to-peer {type: startedTyping|stoppedTyping}; the server fills in
+        "from" and the client matches the sender by sessionid. Sent as a ROOM
+        broadcast — the signaling server relays it to every session except the
+        sender, so stale participant tracking can't break the indicator
+        (verified: receiver sees sender's own sid in message.sender.sessionid).
         The legacy {"type":"typing","stream":...} format is ignored by
         current Talk clients."""
-        announced = False  # typing already announced to the current roster
+        announced = False  # typing already announced
         while True:
-            typing_active = time.time() < self._typing_until
-            if typing_active and self._participants:
-                for sid in self._participants:
-                    if sid == self._public_sid:
-                        continue
+            try:
+                typing_active = time.time() < self._typing_until
+                if typing_active:
                     await ws.send(json.dumps({
                         "type": "message",
                         "message": {
-                            "recipient": {"type": "session", "sessionid": sid},
+                            "recipient": {"type": "room"},
                             "data": {"type": "startedTyping"}}}))
-                announced = True
-            elif announced:
-                for sid in self._participants:
-                    if sid == self._public_sid:
-                        continue
-                    try:
-                        await ws.send(json.dumps({
-                            "type": "message",
-                            "message": {
-                                "recipient": {"type": "session", "sessionid": sid},
-                                "data": {"type": "stoppedTyping"}}}))
-                    except Exception:
-                        pass
-                announced = False
+                    announced = True
+                elif announced:
+                    await ws.send(json.dumps({
+                        "type": "message",
+                        "message": {
+                            "recipient": {"type": "room"},
+                            "data": {"type": "stoppedTyping"}}}))
+                    announced = False
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                # dead ws — exit quietly, the reconnect spawns a fresh loop
+                log.debug("[hpb] typing loop exiting: %s", e)
+                return
             await asyncio.sleep(TYPING_INTERVAL)
